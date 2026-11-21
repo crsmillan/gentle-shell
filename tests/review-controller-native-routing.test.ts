@@ -11,8 +11,9 @@ import { setWindowsAclAuthorityForTesting } from "../lib/review-candidate-view-o
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { __testing, createGentleAiExtension, PendingReviewConsentRegistry } from "../extensions/gentle-ai.ts";
 import { CandidateViewError, CandidateViewRegistry } from "../lib/review-candidate-view.ts";
-import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, NativeReviewConsentRequiredError, type NativeReviewCli } from "../lib/native-review-cli.ts";
+import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, NativeReviewConsentRequiredError, NativeReviewIntegrationError, type NativeReviewCli } from "../lib/native-review-cli.ts";
 import { decodeReviewLastEventClosureV1, decodeReviewConsentV3, decodeReviewStatusV3, type ReviewCollectInputV3, type ReviewStatusV3 } from "../lib/review-integration-v2.ts";
+import { statusV9 } from "./support/status-v9.ts";
 
 // Coordination tests use fixture authority; real Windows ACL coverage lives
 // in review-candidate-view.test.ts, in a separate test process.
@@ -3146,7 +3147,6 @@ test("INSPECT ambient input with top-level selected-empty stays read-only when s
 	let mutationCalls = 0;
 	const mutationMethods = [
 		"start", "answerConsent", "reclaim", "recover", "abandon",
-		"quarantineLegacy", "reconcileAuthority", "repairLegacyAlias", "repair",
 		"captureResult", "captureCorrectionPlan", "captureProviderRole", "captureUnachievableLens",
 		"reviewMode",
 	] as const satisfies readonly (keyof NativeReviewCli)[];
@@ -3433,7 +3433,7 @@ test("controller forwards AbortSignal and retains typed native diagnostics witho
 // roughly 28k characters per call and again on every blocked retry. The
 // consumed projection is collectBindings; the raw inputs are the duplicate.
 function fourLensCollectStatus(): { raw: Record<string, unknown>; lenses: readonly string[] } {
-	const captured = JSON.parse(readFileSync(new URL("./fixtures/devbinary/status-v5-capture-result-submission.captured.json", import.meta.url), "utf8")) as Record<string, unknown>;
+	const captured = statusV9(JSON.parse(readFileSync(new URL("./fixtures/devbinary/status-v5-capture-result-submission.captured.json", import.meta.url), "utf8"))) as Record<string, unknown>;
 	const nextTransition = captured.next_transition as { collect: { inputs: Array<Record<string, unknown>> } };
 	const template = nextTransition.collect.inputs[0]!;
 	const lenses = ["review-risk", "review-readability", "review-reliability", "review-resilience"] as const;
@@ -3529,6 +3529,44 @@ test("request context survives unrelated untracked selection and its START conti
  const selected = await run({ operation: "select-intended-untracked", selectionBinding: stopped.selectionBinding, intendedUntracked: [eligible] });
  assert.equal(starts.length, 1, JSON.stringify(selected));
  assert.equal(starts[0].requestContextPath, context);
+});
+
+test("START with escalate and eligible untracked files still stops for the selection, then carries the escalate only in the native START", async (t) => {
+ const escalate = { item: 2, reason: "changes the auth boundary" };
+ for (const withEscalate of [false, true]) {
+  const { cwd, eligible, initial, target } = untrackedStopFixture(t);
+  const retained = new Map(), starts: Array<Record<string, unknown>> = [], statuses: Array<Record<string, unknown>> = [];
+  // Like the provider: an escalation is refused on any STATUS that does not offer a fresh START.
+  const native = { targetStatus: async (request: Record<string, unknown>) => {
+    statuses.push(request);
+    const status = "intendedUntrackedSelection" in request ? target : initial;
+    if (request.escalate !== undefined && status.nextTransition?.kind !== "execute") throw new Error("invalid_request: --escalate-item can only preflight a fresh START");
+    return status; },
+   start: async (request: Record<string, unknown>) => { starts.push(request); return { lineageId: "escalated-selected", state: "reviewing", riskLevel: "high", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [], raw: {} }; }
+  } as unknown as NativeReviewCli;
+  const run = (parameters: Record<string, unknown>) => __testing.executeReviewControllerOperation(parameters, cwd, native, undefined, undefined, undefined, retained);
+  const stopped = await run({ operation: "start", input: JSON.stringify({ mode: "ordinary", ...(withEscalate ? { escalate } : {}) }) });
+  assert.equal(typeof stopped.selectionBinding, "string", JSON.stringify(stopped));
+  await run({ operation: "select-intended-untracked", selectionBinding: stopped.selectionBinding, intendedUntracked: [eligible] });
+  assert.equal(starts.length, 1);
+  assert.deepEqual(starts[0].escalate, withEscalate ? escalate : undefined);
+  for (const request of statuses) assert.equal("escalate" in request, false, "the host's own STATUS preflights never carry the escalation");
+  if (!withEscalate) assert.equal("escalate" in starts[0]!, false);
+ }
+});
+
+test("START rejects an invalid escalate as native-start-input-invalid before any native call", async (t) => {
+ const { cwd, initial } = untrackedStopFixture(t);
+ let calls = 0;
+ const native = { targetStatus: async () => { calls++; return initial; }, start: async () => { calls++; throw new Error("must not start"); } } as unknown as NativeReviewCli;
+ for (const bad of [{ item: 9, reason: "x" }, { item: 2, reason: "" }, { item: 2, reason: "é".repeat(251) }, { item: 2, reason: "x", extra: 1 }, { item: 2, reason: "a\nb" }]) {
+  const rejected = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary", escalate: bad }) }, cwd, native);
+  assert.equal(rejected.outcome, "native-start-input-invalid", JSON.stringify(rejected));
+  assert.equal(rejected.status, "blocked");
+  assert.equal(rejected.reason, "escalate-invalid");
+  assert.equal(rejected.mutation_performed, false);
+ }
+ assert.equal(calls, 0);
 });
 
 test("START options survive intended-untracked continuation with and without request context", async t => {
@@ -3643,4 +3681,186 @@ test("request context rechecks sensitive aliases before selection and consent co
   const result = await run(phase === "selection" ? { operation: "select-intended-untracked", selectionBinding: stopped.selectionBinding, intendedUntracked: [eligible] } : { operation: "answer-consent", input: JSON.stringify({ consentBinding: stopped.consent_binding, answer: "granted" }) });
   assert.equal(result.reason, "request-context-sensitive-path", phase); assert.equal(queries, before); assert.equal(answers, 0);
  }
+});
+
+// gentle-shell#3412: a lineage retained with its committed-range projection is
+// bound by that range alone. A status input that carries only an untracked
+// declaration (or nothing) must not be validated against the workspace
+// projection, and the committed range sends no untracked selection flags.
+test("bound STATUS on a committed-only lineage uses the retained range and ignores untracked declarations", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const cwd = repository(t), lineageId = "committed-only-bound";
+	const view = candidateViews.create({ contributorRoot: cwd, baseRef: execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim(), committedOnly: true });
+	candidateViews.retain(view.token, lineageId);
+	const frozen = candidateViews.resolveProjection(lineageId, cwd);
+	const requests: Array<Record<string, unknown>> = [];
+	const native = { targetStatus: async (request: Record<string, unknown>) => { requests.push(request); return status(lineageId); } } as unknown as NativeReviewCli;
+	for (const input of [undefined, "{}", JSON.stringify({ untrackedScope: "exclude" })]) {
+		const result = await __testing.executeReviewControllerOperation({ operation: "status", lineageId, ...(input === undefined ? {} : { input }) }, cwd, native, undefined, candidateViews);
+		assert.notEqual((result as { outcome?: string }).outcome, "native-status-input-invalid", String(input));
+	}
+	assert.deepEqual(requests, Array.from({ length: 3 }, () => ({ cwd, lineageId, agent: "pi", baseRef: frozen.baseCommit, committedOnly: true })));
+});
+
+test("bound STATUS on a workspace-projection lineage still validates its untracked declaration", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const cwd = repository(t), lineageId = "workspace-bound";
+	const view = candidateViews.create({ contributorRoot: cwd });
+	candidateViews.retain(view.token, lineageId);
+	const native = { targetStatus: async () => status(lineageId) } as unknown as NativeReviewCli;
+	for (const input of ["{}", JSON.stringify({ untrackedScope: "exclude" })]) {
+		const result = await __testing.executeReviewControllerOperation({ operation: "status", lineageId, input }, cwd, native, undefined, candidateViews);
+		assert.deepEqual({ outcome: (result as { outcome?: string }).outcome, reason: (result as { reason?: string }).reason }, { outcome: "native-status-input-invalid", reason: "untracked-selection-invalid" });
+	}
+});
+
+function committedStatus(lineageId: string): ReviewStatusV3 {
+	const committed = status(lineageId);
+	(committed.projection as { kind: string; projection: string }).kind = "base-diff";
+	(committed.projection as { kind: string; projection: string }).projection = "committed";
+	return committed;
+}
+
+test("fresh-session bound STATUS {} and exclude resolve an unretained committed-only lineage through its own binding", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const cwd = repository(t), lineageId = "committed-fresh";
+	const requests: Array<Record<string, unknown>> = [];
+	const native = { targetStatus: async (request: Record<string, unknown>) => { requests.push(request); return committedStatus(lineageId); } } as unknown as NativeReviewCli;
+	for (const input of ["{}", JSON.stringify({ untrackedScope: "exclude" })]) {
+		const result = await __testing.executeReviewControllerOperation({ operation: "status", lineageId, input }, cwd, native, undefined, candidateViews);
+		assert.notEqual((result as { outcome?: string }).outcome, "native-status-input-invalid", input);
+	}
+	assert.equal(requests.length, 2);
+	for (const request of requests) { assert.equal(request.lineageId, lineageId); assert.equal("untrackedScope" in request, false); assert.equal("baseRef" in request, false); }
+});
+
+test("retained committed-only lineage still rejects malformed untracked declarations without native calls", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const cwd = repository(t), lineageId = "committed-malformed";
+	const view = candidateViews.create({ contributorRoot: cwd, baseRef: execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim(), committedOnly: true });
+	candidateViews.retain(view.token, lineageId);
+	let calls = 0;
+	const native = { targetStatus: async () => { calls += 1; return status(lineageId); } } as unknown as NativeReviewCli;
+	for (const body of [
+		{ untrackedScope: "include" },
+		{ untrackedScope: "bogus" },
+		{ untrackedScope: "select", expectedUntrackedInventory: SHA, intendedUntracked: ["../x"] },
+		{ untrackedScope: "select", intendedUntracked: ["a.ts"] },
+	]) {
+		const result = await __testing.executeReviewControllerOperation({ operation: "status", lineageId, input: JSON.stringify(body) }, cwd, native, undefined, candidateViews);
+		assert.deepEqual({ outcome: (result as { outcome?: string }).outcome, reason: (result as { reason?: string }).reason }, { outcome: "native-status-input-invalid", reason: "untracked-selection-invalid" }, JSON.stringify(body));
+	}
+	assert.equal(calls, 0);
+});
+
+test("fresh-session bound STATUS {} on an unretained workspace lineage keeps the untracked-selection refusal", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const cwd = repository(t), lineageId = "workspace-fresh";
+	const native = { targetStatus: async () => status(lineageId) } as unknown as NativeReviewCli;
+	const result = await __testing.executeReviewControllerOperation({ operation: "status", lineageId, input: "{}" }, cwd, native, undefined, candidateViews);
+	assert.deepEqual({ outcome: (result as { outcome?: string }).outcome, reason: (result as { reason?: string }).reason }, { outcome: "native-status-input-invalid", reason: "untracked-selection-invalid" });
+});
+
+// gentle-shell#3412 (probe side effects): the fresh-session probe must keep the
+// untracked refusal on any non-success outcome and never cache a transport refusal.
+const probeRefusal = { outcome: "native-status-input-invalid", reason: "untracked-selection-invalid" };
+const probeOutcome = (result: unknown) => ({ outcome: (result as { outcome?: string }).outcome, reason: (result as { reason?: string }).reason });
+
+test("fresh-session probe keeps the untracked refusal when the provider refuses transport, and does not cache it", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const cwd = repository(t), lineageId = "probe-transport";
+	let calls = 0;
+	const refusal = new NativeReviewIntegrationError({
+		schema: "gentle-ai.review-integration.failure/v2", contract: "gentle-ai.review-integration/v2", operation: "status", phase: "preflight",
+		code: "immutable_review_transport_unsupported", message: "transport unsupported", mutationOutcome: "none", authorityApplicability: "unknown",
+		retrySafe: false, replayability: "none", requiredInputs: [], nextAction: "none",
+	} as never);
+	assert.equal(refusal.failureEnvelope.code, "immutable_review_transport_unsupported");
+	const native = { targetStatus: async () => { calls += 1; throw refusal; } } as unknown as NativeReviewCli;
+	__testing.clearReviewTransportProbeForTesting(native);
+	t.after(() => __testing.clearReviewTransportProbeForTesting(native));
+	for (const input of ["{}", JSON.stringify({ untrackedScope: "exclude" }), "{}"]) {
+		const before = calls;
+		const result = await __testing.executeReviewControllerOperation({ operation: "status", lineageId, input }, cwd, native, undefined, candidateViews);
+		assert.deepEqual(probeOutcome(result), probeRefusal, input);
+		assert.equal(calls, before + 1, `native is called again: ${input}`);
+	}
+});
+
+test("fresh-session probe keeps the untracked refusal on a plain native throw", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const cwd = repository(t), lineageId = "probe-throw";
+	const native = { targetStatus: async () => { throw new Error("boom"); } } as unknown as NativeReviewCli;
+	for (const input of ["{}", JSON.stringify({ untrackedScope: "exclude" })]) {
+		const result = await __testing.executeReviewControllerOperation({ operation: "status", lineageId, input }, cwd, native, undefined, candidateViews);
+		assert.deepEqual(probeOutcome(result), probeRefusal, input);
+	}
+});
+
+test("retained committed lineage: {} and exclude-with-digest equal the omitted-input result", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const cwd = repository(t), lineageId = "committed-equal";
+	const view = candidateViews.create({ contributorRoot: cwd, baseRef: execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim(), committedOnly: true });
+	candidateViews.retain(view.token, lineageId);
+	const native = { targetStatus: async () => committedStatus(lineageId) } as unknown as NativeReviewCli;
+	const run = (input?: string) => __testing.executeReviewControllerOperation({ operation: "status", lineageId, ...(input === undefined ? {} : { input }) }, cwd, native, undefined, candidateViews);
+	const omitted = await run();
+	assert.deepEqual(await run("{}"), omitted);
+	assert.deepEqual(await run(JSON.stringify({ untrackedScope: "exclude", expectedUntrackedInventory: SHA })), omitted);
+});
+
+// gentle-shell#3424 follow-up A1: an older-than-pinned native contract must
+// reach the tool result with its exact actionable message, not a generic
+// native-operation-failed / native-status-unsupported remediation.
+const STATUS_V8_TOO_OLD = "gentle-ai native review status/v8 is older than the supported v9 (gentle-ai v4.6.0); update gentle-ai or remove the dev-binary override";
+const CAPABILITIES_V25_TOO_OLD = "gentle-ai native review capabilities/v2.5 is older than the supported v2.6 (gentle-ai v4.6.0); update gentle-ai or remove the dev-binary override";
+const tooOldNative = (message: string) => ({
+	targetStatus: async () => { throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE, "review/status", true, false, message, { operation: "review/status", error_code: NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE, timed_out: false, output_limit_exceeded: false }); },
+}) as unknown as NativeReviewCli;
+
+test("STATUS surfaces the exact status/v8 too-old message as the remediation", async () => {
+	const result = await __testing.executeReviewControllerOperation({ operation: "status" }, process.cwd(), tooOldNative(STATUS_V8_TOO_OLD));
+	assert.equal(result.status, "blocked");
+	assert.equal(result.reason, STATUS_V8_TOO_OLD);
+});
+
+test("INSPECT surfaces the exact capabilities/v2.5 too-old message as the remediation", async () => {
+	const result = await __testing.executeReviewControllerOperation({ operation: "inspect" }, process.cwd(), tooOldNative(CAPABILITIES_V25_TOO_OLD));
+	assert.equal(result.status, "blocked");
+	assert.equal(result.reason, CAPABILITIES_V25_TOO_OLD);
+});
+
+test("a version-incompatible error with a foreign message never leaks it as remediation", async () => {
+	const result = await __testing.executeReviewControllerOperation({ operation: "status" }, process.cwd(), tooOldNative("/Users/someone/private/path is broken"));
+	assert.equal("reason" in result, false);
+	assert.equal(JSON.stringify(result).includes("/Users/someone"), false);
+});
+
+// A bare capabilities/v2 is a real decoder too-old identity (#3424 follow-up).
+test("INSPECT surfaces the bare capabilities/v2 too-old message", async () => {
+	const message = "gentle-ai native review capabilities/v2 is older than the supported v2.6 (gentle-ai v4.6.0); update gentle-ai or remove the dev-binary override";
+	const result = await __testing.executeReviewControllerOperation({ operation: "inspect" }, process.cwd(), tooOldNative(message));
+	assert.equal(result.reason, message);
+});
+
+// Forged near-matches and not-older versions never become a reason.
+test("forged or not-older too-old messages never surface as reason", async () => {
+	const forged = [
+		STATUS_V8_TOO_OLD.replace("status/v8", "status/v9"), STATUS_V8_TOO_OLD.replace("status/v8", "status/v12"),
+		CAPABILITIES_V25_TOO_OLD.replace("v2.5 is", "v2.6 is"), CAPABILITIES_V25_TOO_OLD.replace("v2.5 is", "v2.7 is"), CAPABILITIES_V25_TOO_OLD.replace("v2.5 is", "v3.0 is"),
+		"x" + STATUS_V8_TOO_OLD, STATUS_V8_TOO_OLD + " /Users/someone/secret", STATUS_V8_TOO_OLD + "\n",
+		STATUS_V8_TOO_OLD.replace("v4.6.0", "v4.5.0"),
+	];
+	for (const message of forged) for (const operation of ["status", "inspect"] as const) {
+		const result = await __testing.executeReviewControllerOperation({ operation }, process.cwd(), tooOldNative(message));
+		assert.equal("reason" in result, false, `${operation}: ${JSON.stringify(message)}`);
+	}
 });

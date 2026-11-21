@@ -43,6 +43,7 @@ import { CARD_CONTENT, cardContent, resolveCardContent, setCardContent, writeCar
 import { claimNotificationOwner } from "../lib/notification-service.ts";
 import { DEFAULT_NOTIFICATION_SETTINGS } from "../lib/notification-policy.ts";
 import { SUPER_YOLO_STATUS_TEXT, yoloBannerContent } from "../lib/yolo-session-policy.ts";
+import { statusV9 } from "./support/status-v9.ts";
 
 
 // Vim fixtures claim the installed pi-tui release, which the adapter gate
@@ -486,7 +487,7 @@ async function reviewSidebarHarness() {
 	ctx.cwd = process.cwd();
 	let sessionId = "shell-session";
 	ctx.sessionManager.getSessionId = () => sessionId;
-	const raw = JSON.parse(readFileSync(new URL("./fixtures/devbinary/status-v5-capture-result-submission.captured.json", import.meta.url), "utf8"));
+	const raw = statusV9(JSON.parse(readFileSync(new URL("./fixtures/devbinary/status-v5-capture-result-submission.captured.json", import.meta.url), "utf8")));
 	raw.action = "stop";
 	raw.projection.paths = ["src/fresh.ts"];
 	const status = decodeReviewStatusV3(raw);
@@ -7461,7 +7462,7 @@ async function mobilePlacementFixture(t: TestContext, headerPlacement: "top" | "
 	root[node]();
 	const state = sidebarState(tui as unknown as TUI);
 	const widget = (ui.widgets.get("gentle-shell-below-input-header") as () => SidebarRail)();
-	const banner = (yoloBannerContent("tui", SUPER_YOLO_STATUS_TEXT) as (tui: TUI) => { render(width: number): string[] })(tui as unknown as TUI);
+	const banner = (yoloBannerContent("tui", SUPER_YOLO_STATUS_TEXT) as (tui: TUI) => { render(width: number): readonly string[] })(tui as unknown as TUI);
 	const layoutRows = () => {
 		const layout = root[node]() as unknown as { entries?: Array<{ component: { render(width: number): string[] } }> };
 		return (layout.entries ?? []).map(({ component }) => component.render(columns).map(stripAnsi).join("\n"));
@@ -7487,7 +7488,7 @@ async function checkMobilePanel(f: Awaited<ReturnType<typeof mobilePlacementFixt
 	await new Promise((resolve) => setImmediate(resolve));
 }
 
-function checkMobileBar(f: Awaited<ReturnType<typeof mobilePlacementFixture>>, rows: string[], width: number) {
+function checkMobileBar(f: Awaited<ReturnType<typeof mobilePlacementFixture>>, rows: readonly string[], width: number) {
 	const text = rows.map(stripAnsi).join("\n");
 	assert.match(text, /main/);
 	assert.match(text, /💥 SUPER-YOLO/);

@@ -250,9 +250,6 @@ import {
 	NATIVE_REVIEW_ABANDON_REASONS,
 	isNativeReviewUnachievableVerbRefused,
 	nativeReviewAbandonAuthorization,
-	nativeReviewLegacyAliasRepairAuthorization,
-	nativeReviewLegacyQuarantineAuthorization,
-	nativeReviewReconcileAuthorization,
 	nativeReviewRecoverAuthorization,
 	NATIVE_REVIEW_AUTHORITY_STATUS,
 	type NativeReviewAuthorityEntry,
@@ -264,11 +261,8 @@ import {
 	NativeReviewIntegrationError,
 	NATIVE_REVIEW_ERROR_CODE,
 	NATIVE_REVIEW_OPERATION,
-	NATIVE_REVIEW_LEGACY_QUARANTINE,
-	NATIVE_REVIEW_LEGACY_ALIAS_REPAIR,
 	NATIVE_REVIEW_MODE_OPERATION,
 	NATIVE_REVIEW_MODE_SOURCE,
-	NATIVE_REVIEW_RECONCILE_ANOMALIES,
 	committedRangeUntrackedExclusion,
 	type NativeReviewCli,
 	type NativeIntendedUntrackedSelectionSubmission,
@@ -315,6 +309,7 @@ import {
 	type ReviewLastEventClosureBinding,
 	type ReviewLastEventClosureV1,
 	type ReviewStatusV3,
+	reviewContractTooOldRemediation,
 } from "../lib/review-integration-v2.ts";
 import { reconcileUnknownReviewLastEventCapture } from "../lib/review-last-event-controller.ts";
 import { registerYoloSessionPolicy, updateYoloPrompt } from "../lib/yolo-session-policy.ts";
@@ -1268,6 +1263,7 @@ async function resolveReviewAssessmentPlan(
 				cwd,
 				...untracked,
 				...(input.baseRef === undefined ? {} : { baseRef: input.baseRef, committedOnly: true as const }),
+				...(input.escalate === undefined ? {} : { escalate: input.escalate }),
 				...(signal === undefined ? {} : { signal }),
 			};
 			assessment = await nativeReviewCli.assess(request);
@@ -1542,6 +1538,7 @@ const FULL_DELEGATION_SENTENCE_REPLACEMENTS: ReadonlyArray<readonly [string, str
 const RDD_ONLY_SENTENCES: readonly string[] = [
 	" When RDD is on and native assess returns a tier, that tier wins.",
 	" (assess `escalate` when RDD is on or unknown)",
+	" RDD on: `escalate` makes review due.",
 	"- An eligible interactive Pi host may resolve `gentle-ai.review-integration.consent/v3` before the envelope reaches the model. Permission: host-owned. If `gentle_review` returns the envelope unresolved, it is still the original provider-owned two-choice contract. Use `ask_user_choice` exactly or relay losslessly and stop. Never add the host action to a decoded or relayed provider envelope.\n",
 	" The native review candidate is a work-unit commit or a PR slice, never a TODO checkbox and never the accumulated feature branch; native review runs only under the user-owned RDD switch.",
 ];
@@ -7445,11 +7442,7 @@ const REVIEW_CONTROLLER_OPERATION = {
 	INSPECT: "inspect",
 	RESET: "reset",
 	RECOVER: "recover",
-	RECOVER_LOCK: "recover-lock",
 	ABANDON: "abandon",
-	QUARANTINE_LEGACY: "quarantine-legacy",
-	RECONCILE_AUTHORITY: "reconcile-authority",
-	REPAIR_LEGACY_ALIAS: "repair-legacy-alias",
 	REPAIR: "repair",
 	// gentle-pi#662: read-only native risk assessment (gentle-ai#4295). Never
 	// mutates review authority state and never requires a lineageId.
@@ -7483,7 +7476,7 @@ const REVIEW_CONTROLLER_PARAMETER_FIELDS = {
 		operation: {
 			type: "string",
 			enum: Object.values(REVIEW_CONTROLLER_OPERATION),
-			description: "Controller operation. Inspect authority before start. Reset requires the exact challenge returned by inspect.",
+			description: "Controller operation. Inspect authority before start. Reset routes to native review reclaim (lineage, actor, reason) after a fresh UI confirmation.",
 		},
 		lineageId: {
 			type: "string",
@@ -7506,7 +7499,7 @@ const REVIEW_CONTROLLER_PARAMETER_FIELDS = {
 		},
 		input: {
 			type: "string",
-			description: "A JSON object or serialized object string for START/ASSESS/answer-consent/abandon/STATUS; every other operation requires a serialized object string. New native ordinary START uses {\"mode\":\"ordinary\"} plus the agent lens selection {\"lenses\":[...],\"lensesReason\":\"<what you touched and how>\"} (both or neither, 1-4 of risk, resilience, readability, reliability; never with focus). answer-consent uses exactly {\"consentBinding\":\"<opaque id>\",\"answer\":\"granted|declined\"}. For Pi v3 use consent.consentBinding; otherwise use top-level consent_binding. Both are Pi-minted, never a lineage id. An explicit baseRef requires committedOnly: true and requests a committed range; baseRef must be HEAD, a full 40- or 64-character commit id, or a ref name. ASSESS accepts an optional object with baseRef, committedOnly, writerModelId, writerEffort, nativeReviewOutcome, and escalate. The escalate is {\"item\":N,\"reason\":\"...\"} with item an integer from 1 to 6 and a non-empty reason of at most 500 characters; any other shape is rejected, and omitting it means no escalation. Ordinary provider capture belongs only to gentle_review_capture. Legacy controller input remains separate.",
+			description: "A JSON object or serialized object string for START/ASSESS/answer-consent/abandon/STATUS; every other operation requires a serialized object string. New native ordinary START uses {\"mode\":\"ordinary\"} plus the agent lens selection {\"lenses\":[...],\"lensesReason\":\"<what you touched and how>\"} (both or neither, 1-4 of risk, resilience, readability, reliability; never with focus). answer-consent uses exactly {\"consentBinding\":\"<opaque id>\",\"answer\":\"granted|declined\"}. For Pi v3 use consent.consentBinding; otherwise use top-level consent_binding. Both are Pi-minted, never a lineage id. An explicit baseRef requires committedOnly: true and requests a committed range; baseRef must be HEAD, a full 40- or 64-character commit id, or a ref name. ASSESS accepts an optional object with baseRef, committedOnly, writerModelId, writerEffort, nativeReviewOutcome, and escalate. The escalate is {\"item\":N,\"reason\":\"...\"} with item an integer from 1 to 6 and a non-empty reason of at most 500 UTF-8 bytes; any other shape is rejected, and omitting it means no escalation. A valid escalate is forwarded to native assess, which makes native review due. Ordinary START accepts the same escalate (one line) and freezes it so the tier and consent read high; INSPECT does not take it. Ordinary provider capture belongs only to gentle_review_capture. Legacy controller input remains separate.",
 		},
 		outputPath: { type: "string", description: "Retired; ignored." },
 		inputPath: { type: "string", description: "Repository-local input file for the retired legacy controller flow." },
@@ -7769,7 +7762,7 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 		}
 	}
 
-	const needsLineage = !([REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.ABANDON, REVIEW_CONTROLLER_OPERATION.QUARANTINE_LEGACY, REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY, REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.ASSESS] as readonly ReviewControllerOperation[]).includes(value.operation);
+	const needsLineage = !([REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.ABANDON, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.ASSESS] as readonly ReviewControllerOperation[]).includes(value.operation);
 	if (needsLineage && (typeof value.lineageId !== "string" || value.lineageId.trim().length === 0)) {
 		throw new Error("Review controller requires a lineageId");
 	}
@@ -7887,39 +7880,24 @@ async function authorizeDestructiveReviewOperation(
 	ctx: ExtensionContext,
 ): Promise<void> {
 	const parameters = parseReviewControllerParameters(parametersValue);
-	// RESET alone carries the legacy repository-wide challenge. Native compact-v2
-	// RECOVER has its own six-field contract and its own derived
-	// `gentle-ai.review-recovery-authorization/v1` binding, neither of which the
-	// legacy `repositoryId`/`commonDirHash`/`inventoryHash`/`confirmation` quartet
-	// can express. Native INSPECT never publishes that quartet either, so
-	// demanding it here made the only supported recovery flow unreachable
-	// (issue #212).
-	// RECOVER authorizes itself in `executeReviewControllerOperation`, the way
-	// REPAIR_LEGACY_ALIAS does, because its binding can only be derived from a
-	// fresh native target-status read. ABANDON joins that self-authorizing
+	// RESET routes to native `review reclaim` (lineage, actor, reason) behind a
+	// fresh UI confirmation. The legacy repository-wide challenge quartet is gone:
+	// its only producer was the deleted legacy detector, so demanding it forced
+	// callers to invent values.
+	// RECOVER authorizes itself in `executeReviewControllerOperation` because its
+	// binding can only be derived from a fresh native target-status read. ABANDON joins that self-authorizing
 	// family for the same reason (issue #1159): its binding is derived from a
 	// fresh native authority inventory read.
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ABANDON) return;
 	const isReset = parameters.operation === REVIEW_CONTROLLER_OPERATION.RESET;
-	const maintenance = nativeMaintenanceOperation(parameters.operation);
-	if (!isReset && maintenance === undefined) return;
+	if (!isReset) return;
 	const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-	if (maintenance !== undefined && (missingNativeMaintenanceInputs(maintenance, input).length > 0 || invalidNativeMaintenanceInput(maintenance, input))) return;
-	if (isReset) {
-		for (const key of ["repositoryId", "commonDirHash", "inventoryHash"] as const) {
-			if (typeof input[key] !== "string" || input[key].length === 0) throw new Error(`Review controller ${parameters.operation} requires an exact string ${key}`);
-		}
-		if (typeof input.confirmation !== "string" || input.confirmation.length === 0) throw new Error(`Review controller ${parameters.operation} requires an exact string confirmation`);
-	}
 	if (!ctx.hasUI) {
 		throw new Error(`Review controller ${parameters.operation.toUpperCase()} requires fresh explicit authorization through the interactive Pi UI; headless execution fails closed`);
 	}
-	const maintenanceAuthorization = maintenance === undefined ? undefined : nativeMaintenanceAuthorization(maintenance, input);
 	const approved = await ctx.ui.confirm(
-		maintenance !== undefined ? `Authorize review authority ${parameters.operation.toUpperCase()}?` : `Authorize destructive review authority ${parameters.operation.toUpperCase()}?`,
-		maintenance !== undefined
-		? ["Operation: " + parameters.operation.toUpperCase(), "Exact published authorization binding:", maintenanceAuthorization!, maintenance === "quarantineLegacy" ? "The native command may quarantine only the published malformed freeze-findings legacy diagnostic." : "The native command may quarantine only the bound invalid recovery successor; the predecessor stays untouched."].join("\n")
-			: [`Operation: ${parameters.operation.toUpperCase()}`, `Repository: ${input.repositoryId}`, `Exact challenge: ${input.confirmation}`, "This invalidates all prior review authority for this repository."].join("\n"),
+		`Authorize destructive review authority ${parameters.operation.toUpperCase()}?`,
+		[`Operation: ${parameters.operation.toUpperCase()}`, `Lineage: ${String(input.lineage ?? "")}`, `Actor: ${String(input.actor ?? "")}`, `Reason: ${String(input.reason ?? "")}`, "This quarantines the lineage's incomplete review store through native gentle-ai review reclaim."].join("\n"),
 	);
 	if (!approved) throw new Error(`Review controller ${parameters.operation.toUpperCase()} was not explicitly authorized`);
 }
@@ -8097,13 +8075,14 @@ async function resolveReviewModeGate(
 // re-establishes negotiated STATUS for this session's Pi host identity.
 const NATIVE_STATUS_UNSUPPORTED_REMEDIATION_COMMAND = "gentle-ai review status --cwd <repo> --contract gentle-ai.review-integration/v2 --agent pi --next-transition";
 
-function nativeStatusUnsupported(operation: ReviewControllerOperation): Record<string, unknown> {
+function nativeStatusUnsupported(operation: ReviewControllerOperation, reason?: string): Record<string, unknown> {
 	return {
 		operation,
 		status: "blocked",
 		outcome: "native-status-unsupported",
 		...(operation === REVIEW_CONTROLLER_OPERATION.START ? nativeStartPreAuthorityRejection() : { mutation_performed: false }),
 		inventory_complete: false,
+		...(reason === undefined ? {} : { reason }),
 		next_action: "check-native-provider-capabilities",
 		remediation_command: NATIVE_STATUS_UNSUPPORTED_REMEDIATION_COMMAND,
 		evidence: {
@@ -8153,12 +8132,19 @@ function nativeRequestContextRefusal(operation: string, error: unknown, facts = 
 		next_action: "use-provider-with-request-context-capabilities" };
 }
 
+// The exact "older than the supported vN" message of a decoded
+// version-incompatible error is path-free, so it is the user-facing remediation.
+function nativeContractTooOldReason(error: unknown, facts = readReviewFailureFacts(error)): string | undefined {
+	if (facts.cli?.code !== NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE || !isRecord(error)) return undefined;
+	return reviewContractTooOldRemediation(error.message);
+}
+
 function nativeStatusFailed(operation: ReviewControllerOperation, error: unknown): Record<string, unknown> {
 	const facts = readReviewFailureFacts(error);
 	const contextRefusal = nativeRequestContextRefusal(operation, error, facts);
 	if (contextRefusal !== undefined) return contextRefusal;
 	const cliError = facts.cli;
-	if (cliError?.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE) return nativeStatusUnsupported(operation);
+	if (cliError?.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE) return nativeStatusUnsupported(operation, nativeContractTooOldReason(error, facts));
 	if (cliError?.code === NATIVE_REVIEW_ERROR_CODE.PACKAGE_BINARY_MISSING) return nativeStatusPackageBinaryMissing(operation, cliError.diagnostics);
 	const timedOut = nativeReadOnlyStatusTimedOut(operation, error, facts);
 	if (timedOut !== undefined) return timedOut;
@@ -8204,66 +8190,9 @@ const NATIVE_RECOVERY_INPUT = {
 	recover: ["predecessorLineage", "expectedPredecessorRevision", "successorLineage", "disposition", "actor", "reason"],
 } as const;
 
-const NATIVE_MAINTENANCE_INPUT = {
-	quarantineLegacy: ["repository", "lineage", "expectedRevision", "diagnostic", "disposition", "actor", "reason"],
-	reconcileAuthority: ["predecessorLineage", "expectedPredecessorRevision", "successorLineage", "expectedSuccessorRevision", "actor", "reason"],
-} as const;
-type NativeMaintenanceOperation = keyof typeof NATIVE_MAINTENANCE_INPUT;
-
-// ABANDON left this caller-supplied family: its binding can only be derived
-// from a fresh native authority inventory read (issue #1159), so it takes the
-// self-authorizing route RECOVER and REPAIR_LEGACY_ALIAS use.
+// ABANDON's binding can only be derived from a fresh native authority
+// inventory read (issue #1159), so it self-authorizes like RECOVER.
 const NATIVE_ABANDON_INPUT = ["lineage", "actor", "reason"] as const;
-
-function nativeMaintenanceOperation(operation: ReviewControllerOperation): NativeMaintenanceOperation | undefined {
-	if (operation === REVIEW_CONTROLLER_OPERATION.QUARANTINE_LEGACY) return "quarantineLegacy";
-	if (operation === REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY) return "reconcileAuthority";
-	return undefined;
-}
-
-function missingNativeMaintenanceInputs(operation: NativeMaintenanceOperation, input: Record<string, unknown>): readonly string[] {
-	return NATIVE_MAINTENANCE_INPUT[operation].filter((key) => !isCanonicalProcessString(input[key]));
-}
-
-function invalidNativeMaintenanceInput(operation: NativeMaintenanceOperation, input: Record<string, unknown>): boolean {
-	if (operation === "quarantineLegacy") return input.diagnostic !== NATIVE_REVIEW_LEGACY_QUARANTINE.DIAGNOSTIC || input.disposition !== NATIVE_REVIEW_LEGACY_QUARANTINE.DISPOSITION;
-	return operation === "reconcileAuthority" && input.anomalies !== undefined && input.anomalies !== NATIVE_REVIEW_RECONCILE_ANOMALIES.COMBINED;
-}
-
-function nativeMaintenanceAuthorization(operation: NativeMaintenanceOperation, input: Record<string, unknown>): string {
-	if (operation === "quarantineLegacy") return nativeReviewLegacyQuarantineAuthorization({ repository: String(input.repository), lineage: String(input.lineage), expectedRevision: String(input.expectedRevision), diagnostic: NATIVE_REVIEW_LEGACY_QUARANTINE.DIAGNOSTIC, disposition: NATIVE_REVIEW_LEGACY_QUARANTINE.DISPOSITION, actor: String(input.actor), reason: String(input.reason) });
-	return nativeReviewReconcileAuthorization({ predecessorLineage: String(input.predecessorLineage), expectedPredecessorRevision: String(input.expectedPredecessorRevision), successorLineage: String(input.successorLineage), expectedSuccessorRevision: String(input.expectedSuccessorRevision), actor: String(input.actor), reason: String(input.reason), ...(input.anomalies === undefined ? {} : { anomalies: NATIVE_REVIEW_RECONCILE_ANOMALIES.COMBINED }) });
-}
-
-async function executeNativeAuthorityMaintenance(
-	operation: ReviewControllerOperation,
-	nativeOperation: NativeMaintenanceOperation,
-	input: Record<string, unknown>,
-	cwd: string,
-	nativeReviewCli: NativeReviewCli | null,
-	signal: AbortSignal | undefined,
-): Promise<Record<string, unknown>> {
-	const method = nativeOperation === "quarantineLegacy" ? nativeReviewCli?.quarantineLegacy : nativeReviewCli?.reconcileAuthority;
-	const nativeCommand = nativeOperation === "quarantineLegacy" ? "review quarantine-legacy" : "review reconcile-authority";
-	if (method === undefined) {
-		return { operation, status: "blocked", outcome: "native-maintenance-unavailable", native_operation: nativeCommand, mutation_performed: false, mutation_outcome: "none", next_action: "install-package-local-gentle-ai-or-run-native-review-cli-directly" };
-	}
-	const missing = missingNativeMaintenanceInputs(nativeOperation, input);
-	if (missing.length > 0) {
-		return { operation, status: "blocked", outcome: "native-input-required", native_operation: nativeCommand, missing_input: missing, mutation_performed: false, mutation_outcome: "none", next_action: "resubmit-with-exact-native-maintenance-input" };
-	}
-	if (invalidNativeMaintenanceInput(nativeOperation, input)) {
-		return { operation, status: "blocked", outcome: "native-input-invalid", native_operation: nativeCommand, mutation_performed: false, mutation_outcome: "none", next_action: "resubmit-with-the-exact-published-native-maintenance-binding" };
-	}
-	try {
-		const result = nativeOperation === "quarantineLegacy"
-			? await nativeReviewCli.quarantineLegacy!({ cwd, repository: String(input.repository), lineage: String(input.lineage), expectedRevision: String(input.expectedRevision), diagnostic: NATIVE_REVIEW_LEGACY_QUARANTINE.DIAGNOSTIC, disposition: NATIVE_REVIEW_LEGACY_QUARANTINE.DISPOSITION, actor: String(input.actor), reason: String(input.reason), maintainerAuthorization: nativeMaintenanceAuthorization(nativeOperation, input), ...(signal === undefined ? {} : { signal }) })
-			: await nativeReviewCli.reconcileAuthority!({ cwd, predecessorLineage: String(input.predecessorLineage), expectedPredecessorRevision: String(input.expectedPredecessorRevision), successorLineage: String(input.successorLineage), expectedSuccessorRevision: String(input.expectedSuccessorRevision), actor: String(input.actor), reason: String(input.reason), ...(input.anomalies === undefined ? {} : { anomalies: NATIVE_REVIEW_RECONCILE_ANOMALIES.COMBINED }), maintainerAuthorization: nativeMaintenanceAuthorization(nativeOperation, input), ...(signal === undefined ? {} : { signal }) });
-		return { operation, native_operation: nativeCommand, result: result.record, mutation_performed: true, mutation_outcome: "committed", next_action: "inspect" };
-	} catch (error) {
-		return nativeOperationFailure(operation, error);
-	}
-}
 
 // Terminal authority states observed in the native lifecycle (closure,
 // retirement, quarantine, abandonment records). Native re-derives the real
@@ -8395,75 +8324,9 @@ async function executeNativeAbandon(
 	}
 }
 
-const NATIVE_LEGACY_ALIAS_REPAIR_INPUT = ["lineage", "actor", "reason"] as const;
-
-async function executeNativeLegacyAliasRepair(
-	input: Record<string, unknown>,
-	cwd: string,
-	nativeReviewCli: NativeReviewCli | null,
-	signal: AbortSignal | undefined,
-	context: ExtensionContext | undefined,
-): Promise<Record<string, unknown>> {
-	const operation = REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS;
-	const nativeOperation = "review repair-legacy-alias";
-	if (Object.keys(input).some((key) => !NATIVE_LEGACY_ALIAS_REPAIR_INPUT.includes(key as (typeof NATIVE_LEGACY_ALIAS_REPAIR_INPUT)[number]))) {
-		return { operation, status: "blocked", outcome: "native-input-invalid", native_operation: nativeOperation, mutation_performed: false, mutation_outcome: "none", next_action: "resubmit-with-lineage-actor-and-reason-only" };
-	}
-	const missing = NATIVE_LEGACY_ALIAS_REPAIR_INPUT.filter((key) => !isCanonicalProcessString(input[key]));
-	if (missing.length > 0) {
-		return { operation, status: "blocked", outcome: "native-input-required", native_operation: nativeOperation, missing_input: missing, mutation_performed: false, mutation_outcome: "none", next_action: "resubmit-with-lineage-actor-and-reason" };
-	}
-	if (nativeReviewCli?.reviewStatus === undefined || nativeReviewCli.repairLegacyAlias === undefined) {
-		return { operation, status: "blocked", outcome: "native-maintenance-unavailable", native_operation: nativeOperation, mutation_performed: false, mutation_outcome: "none", next_action: "install-package-local-gentle-ai-v2.1.11-or-run-native-review-cli-directly" };
-	}
-	let inventory;
-	try {
-		inventory = await nativeReviewCli.reviewStatus({ cwd, ...(signal === undefined ? {} : { signal }) });
-	} catch (error) {
-		return nativeOperationFailure(operation, error);
-	}
-	const candidate = inventory.complete
-		? inventory.entries.filter((entry) =>
-			entry.version === "legacy-v1"
-			&& entry.status === "invalid"
-			&& entry.lineageId === input.lineage
-			&& isCanonicalProcessString(entry.revision)
-			&& entry.problems.length === 1
-			&& entry.problems[0] === NATIVE_REVIEW_LEGACY_ALIAS_REPAIR.DIAGNOSTIC,
-		)
-		: [];
-	if (candidate.length !== 1 || !isCanonicalProcessString(inventory.repository)) {
-		return { operation, status: "blocked", outcome: "native-alias-repair-ineligible", native_operation: nativeOperation, mutation_performed: false, mutation_outcome: "none", next_action: "inspect-complete-native-authority-inventory" };
-	}
-	const entry = candidate[0]!;
-	const request = {
-		cwd,
-		repository: inventory.repository,
-		lineage: entry.lineageId!,
-		expectedRevision: entry.revision!,
-		diagnostic: NATIVE_REVIEW_LEGACY_ALIAS_REPAIR.DIAGNOSTIC,
-		disposition: NATIVE_REVIEW_LEGACY_ALIAS_REPAIR.DISPOSITION,
-		actor: input.actor as string,
-		reason: input.reason as string,
-	};
-	const authorization = nativeReviewLegacyAliasRepairAuthorization(request);
-	if (context?.hasUI !== true) throw new Error("Review controller REPAIR_LEGACY_ALIAS requires fresh explicit authorization through the interactive Pi UI; headless execution fails closed");
-	const approved = await context.ui.confirm(
-		"Authorize review authority REPAIR_LEGACY_ALIAS?",
-		["Operation: REPAIR_LEGACY_ALIAS", "Exact published authorization binding:", authorization, "The native command may quarantine only this fresh, invalid legacy-v1 alias lineage; it never rewrites or validates historical authority."].join("\n"),
-	);
-	if (!approved) throw new Error("Review controller REPAIR_LEGACY_ALIAS was not explicitly authorized");
-	try {
-		const result = await nativeReviewCli.repairLegacyAlias({ ...request, maintainerAuthorization: authorization, ...(signal === undefined ? {} : { signal }) });
-		return { operation, native_operation: nativeOperation, result: result.record, mutation_performed: true, mutation_outcome: "committed", next_action: "inspect" };
-	} catch (error) {
-		return nativeOperationFailure(operation, error);
-	}
-}
-
 /**
  * Routes the destructive controller operations to their closest audited native
- * equivalent: RESET and RECOVER_LOCK map to `gentle-ai review reclaim`
+ * equivalent: RESET maps to `gentle-ai review reclaim`
  * (audited quarantine of one incomplete entry) and RECOVER maps to
  * `gentle-ai review recover` (auditable successor authority). Native inputs
  * the legacy flow never carried are requested through a structured envelope
@@ -8773,7 +8636,7 @@ function isNativeStartUntrackedPath(value: unknown): value is string {
 		&& value.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
 }
 
-function validateNativeStartUntrackedSelection(value: Record<string, unknown>): NativeStartUntrackedSelection {
+function validateNativeStartUntrackedSelection(value: Record<string, unknown>, digestOptional = false): NativeStartUntrackedSelection {
 	const declared = "untrackedScope" in value || "expectedUntrackedInventory" in value || "intendedUntracked" in value;
 	if (!declared) return {};
 	const scope = value.untrackedScope;
@@ -8781,7 +8644,7 @@ function validateNativeStartUntrackedSelection(value: Record<string, unknown>): 
 	const intendedUntracked = value.intendedUntracked;
 	if (
 		(scope !== NATIVE_START_UNTRACKED_SCOPE.EXCLUDE && scope !== NATIVE_START_UNTRACKED_SCOPE.SELECT) ||
-		!isCanonicalProcessString(expectedUntrackedInventory) ||
+		(!isCanonicalProcessString(expectedUntrackedInventory) && !(digestOptional && scope === NATIVE_START_UNTRACKED_SCOPE.EXCLUDE && expectedUntrackedInventory === undefined)) ||
 		(intendedUntracked !== undefined && (!Array.isArray(intendedUntracked) || intendedUntracked.some((path) => !isNativeStartUntrackedPath(path) || intendedUntracked.indexOf(path) !== intendedUntracked.lastIndexOf(path))))
 	) return { reason: "untracked-selection-invalid" };
 	const paths = Array.isArray(intendedUntracked) ? intendedUntracked : [];
@@ -8789,7 +8652,7 @@ function validateNativeStartUntrackedSelection(value: Record<string, unknown>): 
 	if (scope === NATIVE_START_UNTRACKED_SCOPE.SELECT && paths.length === 0) return { reason: "untracked-selection-invalid" };
 	return {
 		untrackedScope: scope,
-		expectedUntrackedInventory,
+		expectedUntrackedInventory: expectedUntrackedInventory as string,
 		intendedUntracked: [...paths],
 	};
 }
@@ -8865,7 +8728,7 @@ function nativeStartRejection(reason: string, field?: string): Record<string, un
 							? "native-start-committed-only-required"
 							: reason === "committed-only-invalid"
 								? "native-start-committed-only-invalid"
-								: reason === "unknown-field" || reason === "focus-invalid" || reason === "lenses-invalid" || reason === "untracked-selection-invalid" || reason === "provider-base-offer-invalid" || reason === "provider-base-tree-mismatch"
+								: reason === "unknown-field" || reason === "escalate-invalid" || reason === "focus-invalid" || reason === "lenses-invalid" || reason === "untracked-selection-invalid" || reason === "provider-base-offer-invalid" || reason === "provider-base-tree-mismatch"
 									? "native-start-input-invalid"
 									: "native-start-policy-path-invalid",
 		reason,
@@ -8917,6 +8780,7 @@ interface PendingReviewConsent {
 	untrackedSelection?: RetainedNativeUntrackedSelection;
 	consent: ReviewConsentEnvelope;
 	requestContextPath?: string;
+	escalate?: AgentRiskEscalation;
 	consentDigest: string;
 }
 
@@ -9345,6 +9209,7 @@ function nativeOperationFailure(operation: ReviewControllerOperation | "gentle_r
 	}
 	const mutationOutcome = facts.mutationOutcome;
 	const nativeCliError = facts.cli;
+	const tooOldReason = nativeContractTooOldReason(error, facts);
 	if (nativeCliError?.code === NATIVE_REVIEW_ERROR_CODE.PACKAGE_BINARY_MISSING) return nativeStatusPackageBinaryMissing(operation, nativeCliError.diagnostics);
 	const nativeDiagnostics = nativeCliError?.diagnostics;
 	// Target-status probes use the adapter's review/status diagnostic domain.
@@ -9363,6 +9228,7 @@ function nativeOperationFailure(operation: ReviewControllerOperation | "gentle_r
 		operation,
 		status: "blocked",
 		outcome: "native-operation-failed",
+		...(tooOldReason === undefined ? {} : { reason: tooOldReason }),
 		...(operation === REVIEW_CONTROLLER_OPERATION.START && mutationOutcome === "none"
 			? nativeStartPreAuthorityRejection()
 			: mutationOutcome === "none"
@@ -10416,13 +10282,16 @@ async function negotiatedStatusForHostTransport(
 	request: NativeTargetStatusRequest,
 	retainedSelections: ReviewContinuationRegistry,
 	canonicalRetentionRoot = request.cwd,
+	// gentle-shell#3412: a probe is side-effect free: it neither caches a
+	// transport refusal nor syncs retained selections (the caller decides).
+	probe = false,
 ): Promise<NegotiatedHostTransportStatus> {
 	const provider = nativeReviewCli as unknown as object;
 	const remembered = reviewTransportRefusalByProvider.get(provider);
 	if (remembered !== undefined) return { transport: remembered };
 	try {
 		const status = await nativeReviewCli.targetStatus!({ ...request, agent: REVIEW_HOST_AGENT });
-		syncRetainedNativeStatusSelections(retainedSelections, canonicalRetentionRoot, status, request.baseRef);
+		if (!probe) syncRetainedNativeStatusSelections(retainedSelections, canonicalRetentionRoot, status, request.baseRef);
 		return { status };
 	} catch (error) {
 		const code = error instanceof NativeReviewIntegrationError ? error.failureEnvelope.code : undefined;
@@ -10430,7 +10299,7 @@ async function negotiatedStatusForHostTransport(
 		// other failure remains an error for the caller's normal error path.
 		if (code === undefined || !REVIEW_TRANSPORT_REFUSAL_CODES.has(code)) throw error;
 		const transport: ReviewTransportRefusal = { supported: false, code, message: error.message };
-		reviewTransportRefusalByProvider.set(provider, transport);
+		if (!probe) reviewTransportRefusalByProvider.set(provider, transport);
 		return { transport };
 	}
 }
@@ -11144,18 +11013,9 @@ async function executeReviewControllerOperationImpl(
 		}
 		return { operation: parameters.operation, ...details, ...(includeWorkspaceRoot ? { workspace_root: defaultCwd } : {}) };
 	}
-	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS) {
-		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-		return await executeNativeLegacyAliasRepair(input, defaultCwd, nativeReviewCli, signal, context);
-	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ABANDON) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
 		return await executeNativeAbandon(input, parameters.lineageId, defaultCwd, nativeReviewCli, signal, context);
-	}
-	const maintenance = nativeMaintenanceOperation(parameters.operation);
-	if (maintenance !== undefined) {
-		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-		return await executeNativeAuthorityMaintenance(parameters.operation, maintenance, input, defaultCwd, nativeReviewCli, signal);
 	}
 	if (
 		parameters.operation === REVIEW_CONTROLLER_OPERATION.INSPECT &&
@@ -11365,14 +11225,6 @@ async function executeReviewControllerOperationImpl(
 		return nativeStatusUnsupported(parameters.operation);
 	}
 
-	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK) {
-		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-		if (typeof input.ownerHash !== "string") throw new Error("Lock recovery requires an exact ownerHash");
-		// A stuck legacy mutation lock is an incomplete in-flight entry; the
-		// audited native quarantine owns its removal. Lock recovery is not a
-		// destructive authority reset, so pending authorizations survive.
-		return await executeNativeRecoveryRoute(parameters.operation, "reclaim", input, defaultCwd, nativeReviewCli, signal);
-	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
 		// The authorization binding is Pi-derived, never caller-carried. It is
@@ -11482,10 +11334,7 @@ async function executeReviewControllerOperationImpl(
 		}
 		clearRetainedNativeStatusSelectionsOnTerminal(retainedUntrackedSelections, defaultCwd, status.authority?.lineageId, status.authority?.state); retainNativeCaptureRoutes(retainedUntrackedSelections, defaultCwd, status, frozenTarget?.committedOnly === true ? nativeCommittedRangeSelector(frozenTarget) : undefined);
 		if (status.authority?.version === "compact-v2") return { operation: parameters.operation, repaired: false, compact_authority: "immutable-untouched", status: mapNativeTargetStatus(parameters.operation, status, parameters.lineageId, includeWorkspaceRoot ? defaultCwd : undefined) };
-		if (status.authority?.version !== "legacy-v1") return mapNativeTargetStatus(parameters.operation, status, parameters.lineageId, includeWorkspaceRoot ? defaultCwd : undefined);
-		const store = ReviewTransactionStore.forRepository(defaultCwd);
-		store.repairCurrentAuthority();
-		return { operation: parameters.operation, repaired: true };
+		return mapNativeTargetStatus(parameters.operation, status, parameters.lineageId, includeWorkspaceRoot ? defaultCwd : undefined);
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ACKNOWLEDGE_APPROVED) {
 		const controllerOnlyInput = ["changeName", "idempotencyKey", "transition", "input", "outputPath", "inputPath", "operationId", "lineageIds", "acknowledgeUntrustedBundleSource"]
@@ -11680,6 +11529,7 @@ async function executeReviewControllerOperationImpl(
 			const answered = await nativeReviewCli.answerConsent({
 				cwd: pending.authorityCwd,
 				...(pending.requestContextPath === undefined ? {} : { requestContextPath: pending.requestContextPath }),
+				...(pending.escalate === undefined ? {} : { escalate: pending.escalate }),
 				consent: pending.consent,
 				answer: input.answer,
 				...(signal === undefined ? {} : { signal }),
@@ -11750,8 +11600,13 @@ async function executeReviewControllerOperationImpl(
 		assertSupportedReviewStartMode(rawStart.mode);
 		if (rawStart.mode === REVIEW_MODE.ORDINARY) {
 			if ("policyHash" in rawStart) return nativeStartRejection("legacy-policy-hash-unsupported");
-			const unknownField = Object.keys(rawStart).find((field) => !["mode", "baseRef", "committedOnly", "policyPath", "requestContextPath", "focus", "lenses", "lensesReason", "untrackedScope", "expectedUntrackedInventory", "intendedUntracked"].includes(field));
+			const unknownField = Object.keys(rawStart).find((field) => !["mode", "baseRef", "committedOnly", "policyPath", "requestContextPath", "focus", "lenses", "lensesReason", "escalate", "untrackedScope", "expectedUntrackedInventory", "intendedUntracked"].includes(field));
 			if (unknownField !== undefined) return nativeStartRejection("unknown-field", unknownField);
+			let escalateContext: { escalate?: AgentRiskEscalation } = {};
+			if (rawStart.escalate !== undefined) {
+				try { escalateContext = { escalate: decodeAgentRiskEscalation(rawStart.escalate) }; }
+				catch { return nativeStartRejection("escalate-invalid"); }
+			}
 			if (rawStart.requestContextPath !== undefined && !isCanonicalProcessString(rawStart.requestContextPath)) return nativeStartRejection("request-context-invalid");
 			const requestContext: { requestContextPath?: string } = {};
 			if (rawStart.requestContextPath !== undefined) {
@@ -11770,7 +11625,7 @@ async function executeReviewControllerOperationImpl(
 				? {}
 				: validateNativeStartPolicyPath(defaultCwd, rawStart.policyPath);
 			if (policy.reason !== undefined) return nativeStartRejection(policy.reason);
-			const startContext = snapshotReviewStartContext({ ...requestContext, ...lensSelection, ...(isNativeStartFocus(focus) ? { focus } : {}), ...(policy.policyPath === undefined ? {} : { policyPath: policy.policyPath }) });
+			const startContext = snapshotReviewStartContext({ ...requestContext, ...escalateContext, ...lensSelection, ...(isNativeStartFocus(focus) ? { focus } : {}), ...(policy.policyPath === undefined ? {} : { policyPath: policy.policyPath }) });
 			const baseRef = rawStart.baseRef;
 			if (baseRef !== undefined && !isCanonicalProcessString(baseRef)) return nativeStartRejection("base-ref-invalid");
 			if (baseRef !== undefined && rawStart.committedOnly !== true) return nativeStartRejection("committed-only-required");
@@ -12000,6 +11855,7 @@ async function executeReviewControllerOperationImpl(
 							...(retainedUntrackedSelection === undefined ? {} : { untrackedSelection: retainedUntrackedSelection }),
 							consent: error.consent,
 							...requestContext,
+							...escalateContext,
 							consentDigest,
 						};
 						pendingReviewConsentRegistry.add(pendingReviewConsentSession, pending);
@@ -12136,19 +11992,33 @@ async function executeReviewControllerOperationImpl(
 		if (baseRef !== undefined && !isCanonicalProcessString(baseRef)) return nativeStatusInputRejection("base-ref-invalid");
 		if (baseRef !== undefined && rawStatus?.committedOnly !== true) return nativeStatusInputRejection("committed-only-required");
 		if (baseRef === undefined && rawStatus !== undefined && "committedOnly" in rawStatus) return nativeStatusInputRejection("committed-only-invalid");
-		const untrackedSelection = rawStatus === undefined ? {} : validateNativeStartUntrackedSelection(rawStatus);
-		if (
-			rawStatus !== undefined &&
-			(untrackedSelection.reason !== undefined || (baseRef === undefined && untrackedSelection.untrackedScope === undefined))
-		) return nativeStatusInputRejection(untrackedSelection.reason ?? "untracked-selection-invalid");
-		const retainedUntrackedSelection = cloneRetainedNativeUntrackedSelection(untrackedSelection);
-		const effectiveUntrackedSelection = rawStatus === undefined && parameters.lineageId !== undefined
-			? readRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId)
-			: untrackedSelection;
-		const retainedCommittedTarget = rawStatus === undefined && parameters.lineageId !== undefined && candidateViews?.hasProjection(parameters.lineageId, defaultCwd)
+		// gentle-shell#3412: a lineage with a retained committed-range projection is
+		// bound by that range alone (what the runner uses); it never needs, and must
+		// not be validated against, an untracked selection.
+		const retainedCommittedTarget = baseRef === undefined && parameters.lineageId !== undefined && candidateViews?.hasProjection(parameters.lineageId, defaultCwd)
 			? candidateViews.resolveProjection(parameters.lineageId, defaultCwd)
 			: undefined;
-		const effectiveBaseRef = typeof baseRef === "string" ? baseRef : (retainedCommittedTarget?.committedOnly === true ? nativeCommittedRangeSelector(retainedCommittedTarget) : undefined);
+		const committedRangeBound = retainedCommittedTarget?.committedOnly === true;
+		// A committed range waives the declaration, not its shape: a malformed
+		// declaration is still refused, and a valid one is never forwarded.
+		const shapeSelection = rawStatus === undefined ? {} : validateNativeStartUntrackedSelection(rawStatus, true);
+		let untrackedSelection = rawStatus === undefined || committedRangeBound ? {} : validateNativeStartUntrackedSelection(rawStatus);
+		const workspaceRefusal = rawStatus !== undefined && (untrackedSelection.reason !== undefined || (baseRef === undefined && untrackedSelection.untrackedScope === undefined))
+			? (untrackedSelection.reason ?? "untracked-selection-invalid")
+			: undefined;
+		if (committedRangeBound && shapeSelection.reason !== undefined) return nativeStatusInputRejection(shapeSelection.reason);
+		// gentle-shell#3412: with no retained projection (fresh session), a
+		// well-formed but incomplete declaration may still belong to a committed
+		// lineage; the lineage-only STATUS below decides, else the refusal stands.
+		const probeCommittedRange = !committedRangeBound && workspaceRefusal !== undefined && shapeSelection.reason === undefined && baseRef === undefined &&
+			parameters.lineageId !== undefined && !candidateViews?.hasProjection(parameters.lineageId, defaultCwd);
+		if (workspaceRefusal !== undefined && !committedRangeBound && !probeCommittedRange) return nativeStatusInputRejection(workspaceRefusal);
+		if (probeCommittedRange) untrackedSelection = {};
+		const retainedUntrackedSelection = cloneRetainedNativeUntrackedSelection(untrackedSelection);
+		const effectiveUntrackedSelection = rawStatus === undefined && !committedRangeBound && parameters.lineageId !== undefined
+			? readRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId)
+			: untrackedSelection;
+		const effectiveBaseRef = typeof baseRef === "string" ? baseRef : (committedRangeBound ? nativeCommittedRangeSelector(retainedCommittedTarget) : undefined);
 		if (nativeReviewCli?.targetStatus !== undefined) {
 			try {
 				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
@@ -12160,7 +12030,8 @@ async function executeReviewControllerOperationImpl(
 					// bounds them and drops the raw set from its nested record.
 					...nonBlockingFindingsForRun(),
 					...(signal === undefined ? {} : { signal }),
-				}, retainedUntrackedSelections, defaultCwd);
+				}, retainedUntrackedSelections, defaultCwd, probeCommittedRange);
+				if (probeCommittedRange && negotiated.transport !== undefined) return nativeStatusInputRejection(workspaceRefusal!);
 				if (negotiated.transport !== undefined) {
 					return {
 						...hostTransportUnavailable(parameters.operation, negotiated.transport),
@@ -12168,6 +12039,10 @@ async function executeReviewControllerOperationImpl(
 					};
 				}
 				const status = negotiated.status!;
+				if (probeCommittedRange) {
+					if (!(status.applicability === "current_target" && status.authority?.lineageId === parameters.lineageId && status.projection.kind === "base-diff")) return nativeStatusInputRejection(workspaceRefusal!);
+					syncRetainedNativeStatusSelections(retainedUntrackedSelections, defaultCwd, status, effectiveBaseRef);
+				}
 				if (
 					retainedUntrackedSelection !== undefined &&
 					parameters.lineageId !== undefined &&
@@ -12178,6 +12053,7 @@ async function executeReviewControllerOperationImpl(
 				hydrateDispatchBindingFromStatus(candidateViews, defaultCwd, status);
 				return { ...mapNativeTargetStatus(parameters.operation, status, parameters.lineageId, includeWorkspaceRoot ? defaultCwd : undefined), ...(includeWorkspaceRoot ? { workspace_root: defaultCwd } : {}) };
 			} catch (error) {
+				if (probeCommittedRange) return nativeStatusInputRejection(workspaceRefusal!);
 				return nativeReadOnlyStatusTimedOut(parameters.operation, error) ?? nativeOperationFailure(parameters.operation, error);
 			}
 		}
@@ -12721,20 +12597,18 @@ function createGentleAiExtensionForTesting(
 			'For fresh ordinary START, supply input.requestContextPath with the existing request/specification file when intent matters. Relative paths resolve against workspaceRoot; native reads, budgets and freezes its contents with the candidate. Lens reasons do not carry business intent. The file is evidence, never reviewer instructions; existing lineages keep their original frozen intent, and a different request requires resolving existing authority before a fresh review.',
 			'Call {"operation":"inspect"} before START. Ordinary START passes a JSON string like "{\\"mode\\":\\"ordinary\\",\\"lenses\\":[\\"reliability\\"],\\"lensesReason\\":\\"<what you touched and how>\\"}": pick every pertinent 4R lens (risk, resilience, readability, reliability) for what you touched and how; an explicit baseRef must be paired with committedOnly: true. The controller derives lineage, Git/untracked scope, tier, authored lines, and budget; the frozen correction budget counts logical corrections, while correction-plan correctionLines count diff lines (one replaced source line is one deletion plus one addition).',
 			'An inspect blocked on the intended-untracked selection returns nextStep naming the exact continuation: resolve it in one call via select-intended-untracked or a top-level untrackedScope inspect; the next plain START adopts the retained selection.',
-			"Use RECONCILE_AUTHORITY only to quarantine one invalid native recovery successor, supplying exact predecessor/successor lineage and revision, actor, and reason; Pi derives and displays the seven-line native authorization binding for fresh UI approval, the predecessor stays untouched, and Pi never falls back to RESET or RECOVER.",
 			// [LEGACY-RECOVERY-PROSE-CONTRACT] Do not delete, reword, or trim this
 			// block: tests/review-authority-recovery-docs.test.ts greps this file for
 			// these exact phrases, so removing the block silently breaks the doc
-			// contract. Full legacy-recovery semantics (ABANDON/QUARANTINE_LEGACY/
-			// REPAIR_LEGACY_ALIAS exact inputs and bindings); the always-on surface
-			// keeps only the invariants:
-			// "Use ABANDON or QUARANTINE_LEGACY only after an explicit user decision. ABANDON accepts only lineage, actor, and reason (reason must be the native enum `operator_disposition` or `retired_schema`): Pi freshly reads the native authority inventory, derives the lineage's revision, snapshot identity, and discarded-work summary, and renders the exact eight-line binding before interactive approval; caller-supplied inventory-derived fields are rejected. QUARANTINE_LEGACY accepts only the published malformed freeze-findings diagnostic/disposition. A dual reconciliation may supply only anomalies `unchanged_target,malformed_recovery_authorization` in that exact order. Use REPAIR_LEGACY_ALIAS only with lineage, actor, and reason: Pi freshly reads native inventory and derives repository, revision, diagnostic, disposition, and the exact eight-line binding before interactive approval. `review dispose-result` is unsupported pending design."
-			"Use ABANDON, QUARANTINE_LEGACY, or REPAIR_LEGACY_ALIAS only after an explicit user decision with exact provider-issued inputs; Pi freshly reads the native inventory, renders the exact authorization binding for interactive approval, and rejects caller-supplied inventory-derived fields. `review dispose-result` is unsupported pending design.",
+			// contract. Full ABANDON semantics (exact inputs and binding); the
+			// always-on surface keeps only the invariants:
+			// "Use ABANDON only after an explicit user decision. ABANDON accepts only lineage, actor, and reason (reason must be the native enum `operator_disposition` or `retired_schema`): Pi freshly reads the native authority inventory, derives the lineage's revision, snapshot identity, and discarded-work summary, and renders the exact eight-line binding before interactive approval; caller-supplied inventory-derived fields are rejected. `review dispose-result` is unsupported pending design."
+			"Use ABANDON only after an explicit user decision with exact provider-issued inputs; Pi freshly reads the native inventory, renders the exact authorization binding for interactive approval, and rejects caller-supplied inventory-derived fields. `review dispose-result` is unsupported pending design.",
 			"Lens, refuter, and validator verdicts are admitted natively, never Pi-authored; ordinary capture uses gentle_review_capture with exactly one current provider-owned collectBinding and never follows another transition.",
-			"For blocked-legacy or blocked-mixed, do not call START repeatedly: explain invalidation, then call RESET or RECOVER only after explicit user authorization. Both are destructive, routed to audited native `gentle-ai review reclaim` (only RESET carries the legacy hashes and confirmation challenge) and `gentle-ai review recover` (exactly six inputs; never the reset challenge or a maintainerAuthorization): Pi reads fresh native target status, derives the exact native authorization binding for fresh UI approval, and re-reads status before mutating. Negotiated target status supplies the sole accepted recovery disposition, and a caller-supplied substitute is rejected. Treat a native-input-required envelope as a request for exact values, never as permission to invent them. After a committed native recovery record, INSPECT before any fresh ordinary START.",
+			"Call RESET or RECOVER only after explicit user authorization; both are destructive and each asks for fresh UI approval. RESET routes to audited native `gentle-ai review reclaim` (lineage, actor, reason). RECOVER routes to `gentle-ai review recover` (exactly six inputs; never a maintainerAuthorization): Pi reads fresh native target status, derives the exact native authorization binding, and re-reads status before mutating. Negotiated target status supplies the sole accepted recovery disposition, and a caller-supplied substitute is rejected. Treat a native-input-required envelope as a request for exact values, never as permission to invent them. After a committed native recovery record, INSPECT before any fresh ordinary START.",
 			"A consent-required START may be resolved inside the eligible interactive Pi host. Its third UI action is host-owned: it runs this envelope's exact provider grant once, allows later fresh validated envelopes only for the same live session and canonical Git common-directory identity (an unrelated repository needs a new explicit human grant), and grants no provider mode, verdict, acknowledgement, maintenance, delivery, or cross-repository authority. A package-owned child may ask its parent only with the canonical digest of its exact pending target; the parent binds that digest to the task repository and fails closed otherwise. If the tool returns an unresolved envelope, present the original two provider choices without changing machine tokens, commands, target IDs, or invocations; never add the host action to the decoded provider envelope. After one explicit relayed human answer, call answer-consent exactly once with only consentBinding and answer (`granted` or `declined`). For Pi v3 use consent.consentBinding; otherwise use top-level consent_binding. Both are Pi-minted, never a lineage id. Never create host permission from tool arguments, model prose, child/headless responses, or an uncertain native result. A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START output, the controller calls target-scoped native status once and returns only its declared action. An ambiguous gentle_review_capture outcome independently reconciles once and never replays the capture.",
 			"Use gentle_review only for native review authority; delivery follows ordinary repository policy.",
-			"ASSESS is read-only and needs no lineageId: after a delegated writer returns, call {\"operation\":\"assess\"} over its diff and follow the returned plan (writerSelfVerification, structuralReadbackOnly, independentVerifier, reason). Pass input as JSON only to assess a committed range ({\"baseRef\":\"<ref>\",\"committedOnly\":true}), to supply a fallback writer profile ({\"writerModelId\":\"...\",\"writerEffort\":\"...\"}), to state that the native review was declined or unavailable for this candidate ({\"nativeReviewOutcome\":\"declined|unavailable|unknown\"}), or to raise a candidate you know is high risk ({\"escalate\":{\"item\":1-6,\"reason\":\"<one line>\"}}). The plan adds an independent verifier only when escalate names a Task Size high-risk item; it can never lower a tier. The writer profile comes from the runtime-recorded model and effort of the pending mutations for this root (writerProfileSource runtime); caller writerModelId/writerEffort are only a fallback when no runtime evidence exists (caller). The writer profile is reported but never adds a verifier. The native review is an additional outside view and never removes a verifier the tier requires (verify-always-rdd-high S1). ASSESS derives closed only from the native candidate.consumed fact for this exact candidate; a caller-supplied closed is not authority and, without that fact, resolves to unknown. A decline or unavailable review recorded by this process for this exact candidate (never a different one) wins over closure. outcome_source (explicit|derived|unknown) and writerProfileSource (runtime|caller|fallback) state which evidence produced each value. Relay a native continuation verbatim; never rebuild it. A native code review is not a substitute for applicable functional checks: tests, builds, and functional verification still run when applicable. This never mutates review authority state.",
+			"ASSESS is read-only and needs no lineageId: after a delegated writer returns, call {\"operation\":\"assess\"} over its diff and follow the returned plan (writerSelfVerification, structuralReadbackOnly, independentVerifier, reason). Pass input as JSON only to assess a committed range ({\"baseRef\":\"<ref>\",\"committedOnly\":true}), to supply a fallback writer profile ({\"writerModelId\":\"...\",\"writerEffort\":\"...\"}), to state that the native review was declined or unavailable for this candidate ({\"nativeReviewOutcome\":\"declined|unavailable|unknown\"}), or to raise a candidate you know is high risk ({\"escalate\":{\"item\":1-6,\"reason\":\"<one line>\"}}). The plan adds an independent verifier only when escalate names a Task Size high-risk item; it can never lower a tier. An escalation is also forwarded to native assess, which raises the tier to high and reports reviewDue true, so a native review becomes due (due is computed only by native). The writer profile comes from the runtime-recorded model and effort of the pending mutations for this root (writerProfileSource runtime); caller writerModelId/writerEffort are only a fallback when no runtime evidence exists (caller). The writer profile is reported but never adds a verifier. The native review is an additional outside view and never removes a verifier the tier requires (verify-always-rdd-high S1). ASSESS derives closed only from the native candidate.consumed fact for this exact candidate; a caller-supplied closed is not authority and, without that fact, resolves to unknown. A decline or unavailable review recorded by this process for this exact candidate (never a different one) wins over closure. outcome_source (explicit|derived|unknown) and writerProfileSource (runtime|caller|fallback) state which evidence produced each value. Relay a native continuation verbatim; never rebuild it. A native code review is not a substitute for applicable functional checks: tests, builds, and functional verification still run when applicable. This never mutates review authority state.",
 		],
 		parameters: REVIEW_CONTROLLER_PARAMETERS,
 		executionMode: "sequential",
@@ -12915,6 +12789,7 @@ function createGentleAiExtensionForTesting(
 					lineageId: { type: "string" }, lenses: { type: "array", minItems: 1, maxItems: 4, items: { type: "string", enum: ["risk", "resilience", "readability", "reliability"] } },
 					lensesReason: { type: "string" }, requestContextPath: { type: "string" }, untrackedScope: { type: "string", enum: ["exclude", "select"] },
 					intendedUntracked: { type: "array", items: { type: "string" } },
+					escalate: { type: "object", additionalProperties: false, required: ["item", "reason"], description: "Pass the same escalate you named on assess so the run's assessment and START reflect it and make review due: {item: integer 1-6 high-risk item, reason: one line, non-empty, at most 500 UTF-8 bytes}. Ignored on resume with lineageId.", properties: { item: { type: "integer", minimum: 1, maximum: 6 }, reason: { type: "string", minLength: 1 } } },
 				},
 			},
 			executionMode: "sequential",
@@ -13283,10 +13158,10 @@ function createGentleAiExtensionForTesting(
 		// Another concurrent end or ACK may already have consumed this prefix.
 		if (!pendingReviewMutation(ctx.sessionManager, root, mutation)) return;
 		if (status.nextTransition?.kind !== "execute" || status.nextTransition.execute.operation !== "review.start") return;
-		// verify-always-rdd-high S2: automatic review is for high risk only, so a
-		// candidate the native assessment reports not review_due earns no nudge.
-		// An assessment that cannot answer, or an older binary without
-		// review_due, keeps the nudge.
+		// rdd-simplification T2: native `assess.review_due` is the only due decision.
+		// STATUS above supplies the offer and target identity, never due-ness. Only
+		// an explicit false suppresses the nudge; an assessment that cannot answer,
+		// or an older binary without review_due, keeps the nudge (fail closed).
 		if (nativeReviewCli.assess !== undefined) {
 			let reviewDue: boolean | undefined;
 			try { reviewDue = (await nativeReviewCli.assess({ cwd: root, ...selector })).reviewDue; }
