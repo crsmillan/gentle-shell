@@ -66,7 +66,7 @@ The [v2.6.0 release](https://github.com/Gentleman-Programming/gentle-pi/releases
 - The Agents List and Details views preserve the orchestrator/session hierarchy and completion, abort, and lost-exit history. Parent-child queries and notifications have an explicit handoff path, while model, effort, and usage stay observable per task.
 - Named `/gentle:profiles` atomically route the orchestrator separately from packaged and review roles, and carry a per-profile orchestrator workflow mode (`w` on the models screen: organic, where the orchestrator may implement inline, or full delegation, where every implementation goes to a subagent); see the [technical reference](readme-reference.md#agent-model-profiles) for the profile model. Full delegation pays off with an expensive orchestrator and light workers; on small tasks it costs a few times the wall time of organic, so see [Orchestrator workflow mode](readme-reference.md#orchestrator-workflow-mode) for the measured cost and which mode to pick.
 
-The source checkout prepares `gentle-pi` `4.9.0` with a package-local Gentle AI `v4.6.0` pin; this does not imply that the package release has been published. The published provider bundle matches the existing `1.6.0` mirror, and the native review CLI still advertises `capabilities/v2.6`.
+The source checkout declares `gentle-pi` `5.0.0` with a package-local Gentle AI `v5.0.0` pin; the source manifest does not establish whether that version is published. The mirror uses the signed provider bundle published with v5.0.0. Its bundle version stays `1.6.0`, and the native review CLI still advertises `capabilities/v2.6` without legacy authority.
 
 ## Shell interactions and runtime behavior
 
@@ -108,7 +108,7 @@ At 140 columns or wider, fullscreen with the split header draws an IDE inside th
                                                              └ job-1
  ─ ✿ waiting for input ───────────────── INSERT ─        ▾ AGENTS              3 running · 1 waiting
  › type, or / for commands                                 …
- main ±3 │ SUPER-YOLO     gpt-5.5 · medium · claude (session) │ ctx ▰▰▰▰▱▱▱▱ 45% │ $9.49 sub │ usage · alt+u
+ main ±3 │ SUPER-YOLO     gpt-5.5 · medium · claude (session) │ ctx ▰▰▰▰▱▱▱▱ 45% (133k to compact) │ $9.49 sub │ usage · alt+u
 ```
 
 - **Title row.** The project name and path once, and the session name on the right; when space runs out the path gives way first. The effective agent profile (with its source suffix, `claude (session)`) follows the model and effort in the status bar (`claude-opus-5-5 · high · claude (session)`), giving way before the usage does, and opens the rail's Stats section (`profile claude (session)`); Integrations no longer lists it. On a phone with split selected, the title row carries the model, effort and profile, since the narrow status bar leaves them out.
@@ -125,10 +125,10 @@ At 140 columns or wider, fullscreen with the split header draws an IDE inside th
 The regular-mode compact bar replaces pi's three-line footer with a single line of segments:
 
 ```text
-✿ gentle shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ MCP: 3 servers enabled        Release notes
+✿ gentle shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% (133k to compact) ⟡ $9.49 sub ⟡ MCP: 3 servers enabled        Release notes
 ```
 
-- Context is a gauge, not a number. It turns amber at 80% and red at 95%; after compaction it shows `?%` until the next response.
+- The `ctx` gauge shows the percentage of the model's context window used (amber at 80%, red at 95%) and, when space permits, the estimated tokens left before auto-compaction. The estimate subtracts Pi's effective reserve for the active model (model override, ordinary setting, then 16,384) from the window, then subtracts current usage. At or above that boundary it shows `0 to compact`; Pi's threshold check triggers only above the boundary. `compact off` means auto-compaction is disabled. `? to compact` means the estimate is unavailable, such as after compaction when usage shows `?%` until the next response.
 - Cost carries `sub` when the active model runs on a subscription login.
 - `pi-claude-bridge` records every turn at $0, so a `claude-bridge` turn is priced at the Anthropic list price of the same model when it ends. The cost (shown with `sub`), the Stats section and `/gentle:stats` then show what those tokens would cost on the API, not what the subscription bills. Subagents price their `claude-bridge` turns the same way, so the Stats `agents` row adds them to subagents on other providers. Sessions recorded before this stay at $0.
 - Statuses other extensions publish through `setStatus` are appended as trailing segments; the session name sits at the right edge.
@@ -526,7 +526,7 @@ The canvas server binds `127.0.0.1` on a random port and needs a random per-serv
 
 ### Gentle Tower
 
-Gentle Tower is a web view of every open Gentle Shell session, for people who prefer a picture to a terminal. Each project is a painted building and each session is a floor of it. Open it with `/gentle:tower` inside a session, or with `gentle-shell tower` from any terminal (`--no-open` prints the URL only, `--port <n>` fixes the port). It serves until Ctrl+C or until the session that opened it ends. Hovering anything clickable outlines it and names what a click does; a short tour on the first visit points at the floors, people, rooms, door and top bar, and the `?` button (or the `?` key) shows it again.
+Gentle Tower is a web view of every open Gentle Shell session, for people who prefer a picture to a terminal. Each project is a painted building and each session is a floor of it. Open it with `/gentle:tower` inside a session, or with `gentle-shell tower` from any terminal (`--no-open` prints the URL only, `--port <n>` fixes the port, `--json` prints one JSON line `{"schema":"gentle-shell.tower/v1","url":…,"host":"127.0.0.1","port":…}` instead of the text, for programs such as the desktop app). It serves until Ctrl+C or until the session that opened it ends. Hovering anything clickable outlines it and names what a click does; a short tour on the first visit points at the floors, people, rooms, door and top bar, and the `?` button (or the `?` key) shows it again.
 
 <img width="100%" src="assets/features/gentle-tower.png" alt="Gentle Tower with two floors of the gentle-pi building, their todo bars on the left and the selection strip with Talk, Tasks, Artifacts and Permissions at the bottom">
 

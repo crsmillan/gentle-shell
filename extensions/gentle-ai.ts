@@ -22,6 +22,7 @@ import { allowedEditSurfaces as hasTaskScopedAllowedEditSurfaces, bindSessionRep
 import { sameMessageToolCalls } from "../lib/writer-batch-admission.ts";
 import { rejectUnriskedVerifierLaunch } from "../lib/verifier-admission.ts";
 import { VERIFIER_SETTLE_REMINDER_TYPE, createVerifierSettleReminders, finalAssistantText } from "../lib/verifier-settle-reminder.ts";
+import { trackCodexTurnContinuation } from "../lib/codex-turn-continuation.ts";
 import { consumeReviewMutation, pendingReviewMutation, pendingReviewMutationProfiles, recordReviewMutation, type ReceiptSession } from "../lib/review-reminder-receipt.ts";
 import { createReviewSidebarPublisher } from "../lib/review-sidebar-state.ts";
 import { snapshotReviewStartContext } from "../lib/review-start-context.ts";
@@ -147,7 +148,7 @@ import {
 	type ProfilePinSource,
 	type ProfilePinStatus,
 } from "../lib/agent-profile-pin.ts";
-import { clearSessionProfileBinding, readSessionProfileBinding } from "../lib/session-profile-binding.ts";
+import { clearSessionProfileBinding, readSessionProfileBinding, readSessionProfileStartupNone } from "../lib/session-profile-binding.ts";
 import { createSessionProfileIntegration, hasPendingSessionProfileSelection, readCurrentSessionProfileOutcome, runCurrentSessionProfileSelection, waitCurrentSessionProfileSelection, type SessionProfileLifecycleManager } from "../lib/session-profile-integration.ts";
 import { publishSessionProfileOutcome, readSessionProfileAuthority, requireSessionProfileAuthority } from "../lib/session-profile-authority.ts";
 import { isSessionProfileFamilyEntry, type SessionProfileStartupState } from "../lib/session-profile-persistence.ts";
@@ -179,6 +180,27 @@ import {
 	type DesktopReviewOwnerWrite,
 	type DesktopReviewService,
 } from "../lib/desktop-rpc-review.ts";
+import {
+	DESKTOP_STATUS_SERVICE_CHANNEL,
+	DESKTOP_STATUS_SERVICE_SCHEMA,
+	packageStatusSeverity,
+	type DesktopPackageStatus,
+	type DesktopStatusOwnerRead,
+	type DesktopStatusService,
+} from "../lib/desktop-rpc-status.ts";
+import {
+	DESKTOP_BACKGROUND_SUBAGENTS_SERVICE_CHANNEL,
+	DESKTOP_BACKGROUND_SUBAGENTS_SERVICE_SCHEMA,
+	type DesktopBackgroundSubagentsOwnerRead,
+	type DesktopBackgroundSubagentsService,
+} from "../lib/desktop-rpc-background-subagents.ts";
+import {
+	globalPersonaPath,
+	projectPersonaPath,
+	resolvePersonaMode,
+	writePersonaMode as writePersonaModeFiles,
+	type PersonaMode as PersonaConfigMode,
+} from "../lib/persona-config.ts";
 import {
 	REVIEW_HOST_RELAY_FAILURE,
 	REVIEW_HOST_RELAY_PI_TIMEOUT_ENV,
@@ -388,11 +410,15 @@ function packageAssetAudit(owner: PackageAssetOwner): { stale: number; overrides
 	return { stale, overrides };
 }
 
+/** The counts behind `/gentle:status`'s asset lines, shared with the Desktop status read. */
+function packageAssetCounts(cwd: string, owner: PackageAssetOwner): { stale: number; overrides: number; local: number } {
+	return { ...packageAssetAudit(owner), local: localAgentOverrideCount(cwd, owner) };
+}
+
 function packageAssetDiagnosticLines(cwd: string): string[] {
 	return (["delegation", "review"] as const).flatMap((owner) => {
 		const label = owner;
-		const { stale, overrides } = packageAssetAudit(owner);
-		const local = localAgentOverrideCount(cwd, owner);
+		const { stale, overrides, local } = packageAssetCounts(cwd, owner);
 		const lines = [`${stale > 0 ? "warn" : "pass"}: Global ${label} assets stale: ${stale} file(s)`];
 		if (stale > 0) {
 			lines[0] += ` — run /gentle:install-${owner} --force to refresh managed assets`;
@@ -1722,7 +1748,7 @@ async function pathExists(path: string): Promise<boolean> {
 	}
 }
 
-type PersonaMode = "gentleman" | "neutral";
+type PersonaMode = PersonaConfigMode;
 
 const PERSONA_OPTIONS = ["gentleman", "neutral"] as const;
 
@@ -3098,42 +3124,22 @@ function secondaryMergeSourcePath(cwd: string, target: CurrentProfileTarget | un
 	return target !== undefined ? modelConfigPath(cwd) : legacyProjectModelConfigPath(cwd);
 }
 
+// The persona files have one owner, lib/persona-config.ts, shared with the
+// Desktop `persona` config store.
 function projectPersonaConfigPath(cwd: string): string {
-	return join(cwd, ".pi", "gentle-ai", "persona.json");
+	return projectPersonaPath(cwd);
 }
 
 function personaConfigPath(_cwd: string): string {
-	return join(gentleAiConfigHome(), "persona.json");
-}
-
-function readPersonaFile(path: string): PersonaMode | undefined {
-	if (!existsSync(path)) return undefined;
-	try {
-		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-		if (!isRecord(parsed)) return undefined;
-		return parsed.mode === "neutral" ? "neutral" : "gentleman";
-	} catch {
-		return undefined;
-	}
+	return globalPersonaPath(gentleAiConfigHome());
 }
 
 function readPersonaMode(cwd: string): PersonaMode {
-	return (
-		readPersonaFile(projectPersonaConfigPath(cwd)) ??
-		readPersonaFile(personaConfigPath(cwd)) ??
-		"gentleman"
-	);
+	return resolvePersonaMode(cwd, gentleAiConfigHome());
 }
 
 function writePersonaMode(cwd: string, mode: PersonaMode): string[] {
-	const paths = [personaConfigPath(cwd)];
-	const projectPath = projectPersonaConfigPath(cwd);
-	if (existsSync(projectPath)) paths.push(projectPath);
-	for (const path of paths) {
-		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, `${JSON.stringify({ mode }, null, 2)}\n`);
-	}
-	return paths;
+	return writePersonaModeFiles(cwd, gentleAiConfigHome(), mode);
 }
 
 // A pinned or active profile is a complete routing snapshot, so while the
@@ -7292,6 +7298,33 @@ function knownSessionProfileStartup(state: SessionProfileAppendOutcome["state"],
 /** Where a clear goes back to, named with the status label convention. */
 function startupStateText(startup: SessionProfileStartupState): string {
 	return startup === "none" ? "no profile, as this session started" : `the profile this session started with, "${sessionProfileLabel({ kind: "inherited", profile: startup })}", and use it`;
+}
+
+/**
+ * Desktop `clear_profile_binding`: the same owner action as `/gentle:profiles
+ * clear`, behind the apply gate, with its notices recorded instead of shown.
+ * The outcome is read from the binding store, not from notice text: any
+ * owner warning is `not_cleared` (even when the store moved, as after a failed
+ * append), a change is `cleared`, else `unchanged`.
+ */
+async function clearDesktopSessionProfile(context: ExtensionContext): Promise<{ status: "cleared" | "unchanged" | "not_cleared" | "busy" }> {
+	if (!beginDesktopProfileApply()) return { status: "busy" };
+	try {
+		const sessionId = context.sessionManager?.getSessionId?.();
+		const state = () => (typeof sessionId === "string" ? JSON.stringify([readSessionProfileBinding(sessionId) ?? null, readSessionProfileStartupNone(sessionId)]) : "");
+		const before = state();
+		let warned = false;
+		const ui = Object.create(context.ui, {
+			notify: { value: (_message: string, type?: "info" | "warning" | "error") => { if (type === "warning" || type === "error") warned = true; } },
+		});
+		await handleProfilesClear(Object.create(context, { ui: { value: ui, enumerable: true } }) as ExtensionContext);
+		if (warned) return { status: "not_cleared" };
+		return { status: state() !== before ? "cleared" : "unchanged" };
+	} catch {
+		return { status: "not_cleared" };
+	} finally {
+		endDesktopProfileApply();
+	}
 }
 
 /**
@@ -13186,20 +13219,22 @@ function createGentleAiExtensionForTesting(
 	// gets one visible reminder and one continuation per user prompt. Earlier proposed entries are kept. The incoming
 	// `canContinue` is false for a completed run (its last message is the assistant's); Pi re-validates the continuation
 	// after the appended reminder, so it is not a precondition here.
+	const codexFallback = trackCodexTurnContinuation(pi);
 	pi.on("agent_before_settle", (event, ctx) => {
-		if (permissionEnvironment.GENTLE_PI_AGENTS_CHILD === "1") return undefined;
-		const sessionKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
-		if ((verifierSettleNamedRuns.get(sessionKey) ?? 0) > 0) return undefined;
-		if (event.outcome !== "completed") return undefined;
-		const reminder = verifierSettleReminders.beforeSettle(
-			sessionKey,
-			finalAssistantText(event.context.contextMessages),
-		);
-		if (reminder === undefined) return undefined;
-		return {
-			entries: [...event.entries, { type: "custom_message", customType: VERIFIER_SETTLE_REMINDER_TYPE, content: reminder, display: true }],
-			continue: true,
-		};
+		if (permissionEnvironment.GENTLE_PI_AGENTS_CHILD !== "1") {
+			const sessionKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
+			if ((verifierSettleNamedRuns.get(sessionKey) ?? 0) <= 0 && event.outcome === "completed") {
+				const reminder = verifierSettleReminders.beforeSettle(
+					sessionKey,
+					finalAssistantText(event.context.contextMessages),
+				);
+				if (reminder !== undefined) return {
+					entries: [...event.entries, { type: "custom_message", customType: VERIFIER_SETTLE_REMINDER_TYPE, content: reminder, display: true }],
+					continue: true,
+				};
+			}
+		}
+		return codexFallback(event, ctx);
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
@@ -13397,6 +13432,7 @@ function createGentleAiExtensionForTesting(
 			request.respond({
 				schema: DESKTOP_PROFILES_SERVICE_SCHEMA,
 				apply: (applyRequest) => (disposed ? Promise.resolve({ status: "not_applied", notes: [] }) : applyDesktopProfile(ctx, pi, applyRequest)),
+				clear: () => (disposed ? Promise.resolve({ status: "not_cleared" as const }) : clearDesktopSessionProfile(ctx)),
 				dispose: () => {
 					disposed = true;
 				},
@@ -13778,6 +13814,96 @@ function createGentleAiExtensionForTesting(
 					disposed = true;
 				},
 			});
+		} catch {
+			/* obsolete trusted context: discovery expires closed */
+		}
+	});
+
+	// Desktop get/set_background_subagents: the same resolution and the same
+	// global writer as `/gentle:background-subagents`. The bridge asks the user
+	// to confirm before it calls `write`, so the switch stays user-initiated.
+	if (typeof pi.events?.on === "function") pi.events.on(DESKTOP_BACKGROUND_SUBAGENTS_SERVICE_CHANNEL, (payload: unknown) => {
+		if (!payload || typeof payload !== "object") return;
+		const request = payload as Partial<{ context: ExtensionContext; respond(service: DesktopBackgroundSubagentsService): void }>;
+		if (typeof request.respond !== "function" || !request.context) return;
+		if (permissionEnvironment.GENTLE_PI_AGENTS_CHILD === "1") return;
+		const cwd = request.context.sessionManager?.getCwd?.() ?? request.context.cwd;
+		let disposed = false;
+		const read = async (): Promise<DesktopBackgroundSubagentsOwnerRead> => {
+			if (disposed) return { kind: "unavailable" };
+			const resolution = resolveBackgroundSubagentsPolicy(cwd);
+			const source = resolution.source === "project_file" ? "project" as const : resolution.source === "global_file" ? "global" as const : resolution.source;
+			return {
+				kind: "status",
+				state: {
+					effective: resolution.policy,
+					source,
+					malformed: resolution.malformed,
+					projectFile: resolution.projectFileExists ? "present" : "absent",
+					globalFile: resolution.globalFileExists ? "present" : "absent",
+					capability: resolveBackgroundSubagentsCapability(cwd, readActiveToolNames(pi)),
+				},
+			};
+		};
+		try {
+			request.respond({
+				schema: DESKTOP_BACKGROUND_SUBAGENTS_SERVICE_SCHEMA,
+				read,
+				async write(policy) {
+					if (disposed) return { kind: "unavailable" };
+					try {
+						writeGlobalBackgroundSubagentsPolicy(policy);
+					} catch {
+						return { kind: "failed" };
+					}
+					// Report the owner's re-read after the write, not the write's echo.
+					return await read();
+				},
+				dispose: () => { disposed = true; },
+			});
+		} catch {
+			/* obsolete trusted context: discovery expires closed */
+		}
+	});
+
+	// Desktop `get_status`: the facts `/gentle:status` prints, structured and
+	// path-free. The dev-binary override is resolved but never run (no version
+	// spawn), and its path, the routing file path, and the `--force` hints stay
+	// in the terminal answer.
+	if (typeof pi.events?.on === "function") pi.events.on(DESKTOP_STATUS_SERVICE_CHANNEL, (payload: unknown) => {
+		if (!payload || typeof payload !== "object") return;
+		const request = payload as Partial<{ context: ExtensionContext; respond(service: DesktopStatusService): void }>;
+		if (typeof request.respond !== "function" || !request.context) return;
+		if (permissionEnvironment.GENTLE_PI_AGENTS_CHILD === "1") return;
+		const cwd = request.context.sessionManager?.getCwd?.() ?? request.context.cwd;
+		let disposed = false;
+		const read = async (): Promise<DesktopStatusOwnerRead> => {
+			if (disposed) return { kind: "unavailable" };
+			let devBinary: DesktopPackageStatus["devBinary"];
+			try {
+				const override = resolveGentleAiDevBinaryOverride();
+				devBinary = override === undefined ? { state: "inactive", sha256Prefix: null } : { state: "active", sha256Prefix: override.sha256.slice(0, 16) };
+			} catch (error) {
+				if (!(error instanceof GentleAiDevBinaryOverrideError)) throw error;
+				devBinary = { state: "invalid", sha256Prefix: null };
+			}
+			const savedConfig = await readModelRoutingAuthorityAsync(modelConfigPath(cwd), legacyProjectModelConfigPath(cwd));
+			const assets = (owner: PackageAssetOwner) => {
+				const { stale, overrides, local } = packageAssetCounts(cwd, owner);
+				return { stale, userOverrides: overrides, activeAgentOverrides: local };
+			};
+			const status = {
+				package: "active" as const,
+				odd: "active" as const,
+				persona: readPersonaMode(cwd),
+				devBinary,
+				assets: { delegation: assets("delegation"), review: assets("review") },
+				modelConfig: { global: existsSync(modelConfigPath(cwd)) ? "present" as const : "missing" as const, routing: savedConfig.status },
+			};
+			return { kind: "status", status: { ...status, severity: packageStatusSeverity(status) } };
+		};
+		try {
+			request.respond({ schema: DESKTOP_STATUS_SERVICE_SCHEMA, read, dispose: () => { disposed = true; } });
 		} catch {
 			/* obsolete trusted context: discovery expires closed */
 		}
