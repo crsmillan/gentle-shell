@@ -1531,7 +1531,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		if (tasks + running === 0) return undefined;
 		return {
 			block: true,
-			reason: `Standalone sleep is blocked while background work is active (${tasks} task(s), ${running} job(s)). End the turn now; each completion arrives automatically as a session message and starts a new turn.`,
+			reason: `Standalone sleep is blocked while background work is active (${tasks} task(s), ${running} job(s)). Continue independent in-scope work; end the turn to wait only when none remains. Each completion arrives automatically as a session message and starts a new turn.`,
 		};
 	});
 	let activeAgentRuns = 0;
@@ -2807,6 +2807,9 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			const fastPath = fileURLToPath(new URL("./gentle-fast.ts", import.meta.url));
 			if (existsSync(fastPath)) extensions.extensionPaths = [...new Set([...(extensions.extensionPaths ?? []), fastPath])];
 		}
+		const activeMcpTools = typeof pi.getAllTools === "function"
+			? pi.getAllTools().map((tool) => tool.name).filter((name) => name.startsWith("mcp__"))
+			: undefined;
 		const request: TaskRequest = {
 			agent,
 			prompt,
@@ -2815,6 +2818,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			mode,
 			cwd: target ?? parentWorktreeRoot,
 			parentSessionId,
+			...(activeMcpTools && activeMcpTools.length > 0 ? { mcpTools: activeMcpTools } : {}),
 			...(admittedModel === undefined ? {} : { beforeSpawn: () => {
 				if (!current()) throw new Error("Writer session changed before spawn.");
 				registry.validate(originalCwd);
