@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -18,7 +18,7 @@ import {
 	type DesktopFeedTimers,
 } from "../lib/desktop-feed.ts";
 import { createDesktopFeedStore, desktopFeedFile } from "../lib/desktop-feed-store.ts";
-import { createUntrackedLineCounter } from "../lib/desktop-feed-sources.ts";
+import { createParentOf, createUntrackedLineCounter, parseProcessTable, processAncestors, psParentOf } from "../lib/desktop-feed-sources.ts";
 import { SESSION_WORKTREE_ENTRY } from "../lib/session-worktree-registry.ts";
 import { changesModel, type ChangedFile } from "../lib/shell-changes.ts";
 import { DESKTOP_JOBS_SERVICE_CHANNEL, DESKTOP_JOBS_SERVICE_SCHEMA, type DesktopJobEntry } from "../lib/desktop-rpc-jobs.ts";
@@ -151,6 +151,7 @@ function feedHarness(t: test.TestContext, options: Partial<DesktopFeedOptions> =
 		git: () => async () => ({ stdout: "", code: 128 }),
 		parentOf: async () => undefined,
 		profile: () => ({ name: "work (session)", tier: "fast" }),
+		persona: () => undefined,
 		realpath: (path) => `/private${path}`,
 		sweep: () => {},
 		store: (dir, sessionId) => {
@@ -235,12 +236,93 @@ test("S2: unknown sources stay null instead of guessed values", () => {
 	assert.equal(buildDesktopFeedSnapshot(fixtureInput({ activity: { working: true, blocked: 2, blockedLabel: "Choice awaiting input", streaming: false, phase: undefined } })).activity.state, "blocked");
 });
 
+test("should publish the persona the input carries", () => {
+	assert.equal(buildDesktopFeedSnapshot(fixtureInput({ persona: "neutral" })).persona, "neutral");
+	assert.equal(buildDesktopFeedSnapshot(fixtureInput({ persona: "gentleman" })).persona, "gentleman");
+	assert.equal(buildDesktopFeedSnapshot(fixtureInput()).persona, null);
+});
+
+test("should publish the persona the extension resolves for the session cwd", async (t) => {
+	const seen: string[] = [];
+	const h = feedHarness(t, { persona: (cwd) => { seen.push(cwd); return "neutral"; } });
+	await h.start();
+	assert.equal(h.read().persona, "neutral");
+	assert.ok(seen.includes("/w"));
+});
+
+test("should publish the persona resolved from the project file, then the global one, with the default resolver", async (t) => {
+	const root = mkdtempSync(join(tmpdir(), "desktop-feed-persona-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const configHome = join(root, "config");
+	const project = join(root, "project");
+	mkdirSync(configHome, { recursive: true });
+	mkdirSync(join(project, ".pi", "gentle-ai"), { recursive: true });
+	writeFileSync(join(configHome, "persona.json"), JSON.stringify({ mode: "neutral" }));
+	const env = { ...GENTLE_ENV, GENTLE_PI_CONFIG_HOME: configHome };
+
+	const fromGlobal = feedHarness(t, { persona: undefined }, env);
+	await fromGlobal.start(fakeCtx({ cwd: project }));
+	assert.equal(fromGlobal.read().persona, "neutral");
+
+	writeFileSync(join(project, ".pi", "gentle-ai", "persona.json"), JSON.stringify({ mode: "gentleman" }));
+	const fromProject = feedHarness(t, { persona: undefined }, env);
+	await fromProject.start(fakeCtx({ cwd: project }));
+	assert.equal(fromProject.read().persona, "gentleman");
+});
+
+test("should keep the persona null when resolving it throws", async (t) => {
+	const h = feedHarness(t, { persona: () => { throw new Error("unreadable"); } });
+	await h.start();
+	assert.equal(h.read().persona, null);
+});
+
 test("S3: the snapshot names its agent dir as an absolute path, bundled, Pi extension or custom home", () => {
 	for (const dir of ["/Users/me/.gentle-shell/agent", "/Users/me/.pi/agent", "/srv/custom-home"]) {
 		assert.equal(buildDesktopFeedSnapshot(fixtureInput({ identity: { ...fixtureInput().identity, agentDir: dir } })).identity.agentDir, dir);
 	}
 	const relative = buildDesktopFeedSnapshot(fixtureInput({ identity: { ...fixtureInput().identity, agentDir: "rel/agent" } })).identity.agentDir;
 	assert.equal(relative, join(process.cwd(), "rel", "agent"));
+});
+
+// ---- Process ancestry (how a Herdr terminal finds its session) ----
+
+// agent 33128 <- launch.mjs 44120 <- terminal shell 44712 <- 30320 <- 38628 (no parent).
+const WINDOWS_TABLE = "33128,44120\r\n44120,44712\r\n44712,30320\r\n30320,38628\r\n38628,0\r\n";
+
+test("should parse the pid,ppid lines of a Windows process table and ignore other output", () => {
+	const table = parseProcessTable(`${WINDOWS_TABLE}warning: something\r\n\r\nabc,def\r\n`);
+	assert.equal(table.size, 5);
+	assert.equal(table.get(33128), 44120);
+	assert.equal(table.get(38628), 0);
+});
+
+test("should walk the Windows process table up to the terminal shell with one read per walk", async () => {
+	let reads = 0;
+	const read = async () => { reads += 1; return WINDOWS_TABLE; };
+	assert.deepEqual(await processAncestors(44120, 8, createParentOf("win32", read)), [44712, 30320, 38628]);
+	assert.equal(reads, 1);
+	assert.deepEqual(await processAncestors(44120, 8, createParentOf("win32", read)), [44712, 30320, 38628]);
+	assert.equal(reads, 2, "a new walk reads the table again");
+});
+
+test("should publish no ancestors when the Windows process table cannot be read", async () => {
+	assert.deepEqual(await processAncestors(44120, 8, createParentOf("win32", async () => undefined)), []);
+	assert.deepEqual(await processAncestors(44120, 8, createParentOf("win32", async () => { throw new Error("no powershell"); })), []);
+	assert.deepEqual(await processAncestors(44120, 8, createParentOf("win32", () => { throw new Error("spawn failed"); })), []);
+});
+
+test("should stop at a Windows parent that is not a real process", async () => {
+	assert.deepEqual(await processAncestors(10, 8, createParentOf("win32", async () => "10,20\r\n20,1\r\n")), [20]);
+	assert.deepEqual(await processAncestors(20, 8, createParentOf("win32", async () => "20,0\r\n")), []);
+	assert.deepEqual(await processAncestors(99, 8, createParentOf("win32", async () => WINDOWS_TABLE)), []);
+});
+
+test("should keep asking ps per hop outside Windows and never read a process table", async () => {
+	let reads = 0;
+	const parentOf = createParentOf("linux", async () => { reads += 1; return WINDOWS_TABLE; });
+	assert.equal(parentOf, psParentOf);
+	await processAncestors(process.ppid, 8, parentOf);
+	assert.equal(reads, 0);
 });
 
 // ---- Bounds ----
@@ -482,15 +564,67 @@ test("S9: the snapshot lists the session's slash commands: pi's built-ins first,
 	const items = snapshot.commands.items;
 	assert.deepEqual(items.slice(0, DESKTOP_FEED_BUILTIN_COMMANDS.length).map((item) => item.source), DESKTOP_FEED_BUILTIN_COMMANDS.map(() => "builtin"));
 	assert.deepEqual(items.slice(DESKTOP_FEED_BUILTIN_COMMANDS.length), [
-		{ name: "gentle:status", description: "Show the Gentle status", args: null, terminal: true, source: "extension" },
-		{ name: "review", description: `${"x".repeat(DESKTOP_FEED_LIMITS.commandText - 1)}…`, args: null, terminal: false, source: "prompt" },
-		{ name: "skill:odd", description: null, args: null, terminal: false, source: "skill" },
-		{ name: "badname", description: "control characters", args: null, terminal: true, source: "extension" },
+		{ name: "gentle:status", description: "Show the Gentle status", args: null, terminal: true, rpc: true, source: "extension" },
+		{ name: "review", description: `${"x".repeat(DESKTOP_FEED_LIMITS.commandText - 1)}…`, args: null, terminal: false, rpc: true, source: "prompt" },
+		{ name: "skill:odd", description: null, args: null, terminal: false, rpc: true, source: "skill" },
+		{ name: "badname", description: "control characters", args: null, terminal: true, rpc: false, source: "extension" },
 	], "the desktop RPC channel and nameless entries are left out; prompts and skills answer in the chat");
 	assert.equal(snapshot.commands.truncated, false);
 	const many = buildDesktopFeedSnapshot(fixtureInput({ commands: Array.from({ length: 400 }, (_, i) => ({ name: `c${i}`, description: "d", source: "extension" as const })) }));
 	assert.equal(many.commands.items.length, DESKTOP_FEED_LIMITS.commands);
 	assert.equal(many.commands.truncated, true);
+});
+
+test("S4: `terminal` keeps its Herdr meaning for every command after `rpc` is added", () => {
+	// Herdr (gentle-chat, gentle-palette) types every command into the TUI and reads `terminal`
+	// to decide whether to show the Terminal afterwards: these values must not move.
+	const builtinTerminal: Record<string, boolean> = {
+		new: false, resume: true, fork: true, clone: false, tree: true, compact: true, name: false, export: true,
+		session: true, copy: false, model: true, thinking: true, "scoped-models": true, settings: true, hotkeys: true,
+		reload: true, import: true, share: true, changelog: true, trust: true, login: true, logout: true, bug: true,
+	};
+	const snapshot = buildDesktopFeedSnapshot(fixtureInput({
+		commands: [
+			{ name: "gentle:status", description: "declared", source: "extension" },
+			{ name: "gentle:panel", description: "TUI sheet", source: "extension" },
+			{ name: "third-party:thing", description: "undeclared", source: "extension" },
+			{ name: "review", description: "template", source: "prompt" },
+			{ name: "skill:odd", description: "skill", source: "skill" },
+		],
+	}));
+	const terminal = Object.fromEntries(snapshot.commands.items.map((item) => [item.name, item.terminal]));
+	assert.deepEqual(terminal, { ...builtinTerminal, "gentle:status": true, "gentle:panel": true, "third-party:thing": true, review: false, "skill:odd": false });
+});
+
+test("S4: `rpc` is true only for declared commands; undeclared extension commands stay false", () => {
+	const snapshot = buildDesktopFeedSnapshot(fixtureInput({
+		commands: [
+			{ name: "gentle:status", description: "notify only", source: "extension" },
+			{ name: "gentle:persona", description: "select + notify", source: "extension" },
+			{ name: "gentle:panel", description: "ui.custom sheet", source: "extension" },
+			{ name: "gentle:customize", description: "refuses outside the TUI", source: "extension" },
+			{ name: "gentle:guide", description: "TUI only", source: "extension" },
+			{ name: "third-party:thing", description: "undeclared", source: "extension" },
+			{ name: "gentle:status:2", description: "a renamed duplicate is not the declared command", source: "extension" },
+			{ name: "review", description: "template", source: "prompt" },
+			{ name: "skill:odd", description: "skill", source: "skill" },
+		],
+	}));
+	const rpc = Object.fromEntries(snapshot.commands.items.filter((item) => item.source !== "builtin").map((item) => [item.name, item.rpc]));
+	assert.deepEqual(rpc, {
+		"gentle:status": true, "gentle:persona": true,
+		"gentle:panel": false, "gentle:customize": false, "gentle:guide": false, "third-party:thing": false, "gentle:status:2": false,
+		review: true, "skill:odd": true,
+	});
+	for (const item of snapshot.commands.items) assert.equal(typeof item.rpc, "boolean", item.name);
+});
+
+test("S4: built-ins carry `rpc` only where Pi's RPC protocol has a matching command", () => {
+	const rpc = Object.fromEntries(DESKTOP_FEED_BUILTIN_COMMANDS.map((command) => [command.name, command.rpc]));
+	assert.deepEqual(Object.entries(rpc).filter(([, value]) => value).map(([name]) => name).sort(),
+		["clone", "compact", "copy", "export", "fork", "model", "name", "new", "session", "thinking"]);
+	const items = buildDesktopFeedSnapshot(fixtureInput()).commands.items;
+	assert.deepEqual(items, DESKTOP_FEED_BUILTIN_COMMANDS.map((command) => ({ ...command, source: "builtin" })));
 });
 
 test("S9: session operations are listed with the screen they open", () => {
@@ -518,7 +652,7 @@ test("S9: the extension publishes pi's command registry and keeps working withou
 	];
 	await h.start();
 	const extension = h.read().commands.items.filter((item) => item.source !== "builtin");
-	assert.deepEqual(extension, [{ name: "gentle:changes", description: "Open the changes panel", args: null, terminal: true, source: "extension" }]);
+	assert.deepEqual(extension, [{ name: "gentle:changes", description: "Open the changes panel", args: null, terminal: true, rpc: false, source: "extension" }]);
 	assert.ok(!readFileSync(h.file, "utf8").includes("/secret/ext.ts"), "source paths never reach the snapshot");
 	const bare = feedHarness(t);
 	await bare.start();

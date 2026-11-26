@@ -41,8 +41,12 @@ Every live snapshot is a session the desktop shows, wherever it runs: in a
 terminal of the Herdr app window (kind **Herdr**), or in any other terminal —
 the Herdr TUI, Ghostty, a herdr-core terminal this window does not show (kind
 **TUI**). A snapshot counts as live while its publisher's `identity.pid` runs
-(one `ps -p` per refresh for the pids not checked in the last 5 s; without `ps`
-every snapshot counts). A Herdr session takes typed input in its terminal; a TUI
+(one `ps -p` per refresh for the pids not checked in the last 5 s; where `ps`
+cannot start or does not answer, as on Windows, one `tasklist` instead). Only a
+listing that answered decides: `ps` exiting 0, or 1 with nothing on stderr (a pid
+is gone), or `tasklist` exiting 0. A `ps` that rejects its own flags (an MSYS/Git
+`ps` on a Windows `PATH`) decides nothing, and when no listing answers every
+snapshot counts. A Herdr session takes typed input in its terminal; a TUI
 session takes prompts and answers through its inbox (`send_prompt`,
 `answer_question` with `via: "session"`, below). A
 snapshot from an older Gentle Shell without `identity.agentDir` is treated as
@@ -64,10 +68,10 @@ gone or that were not updated for a day. The folder is created `0700` and files
 
 | Field | Content |
 |---|---|
-| `identity` | `sessionId`, exact `sessionFile`, `sessionName`, `cwd`, `realCwd`, `pid`, `ppid`, `ancestors` (nearest first, best effort), `mode`, `agentDir` (absolute agent dir the snapshot lives under), `herdr` (`paneId` from `HERDR_PANE_ID`, `env`) or `null` |
+| `identity` | `sessionId`, exact `sessionFile`, `sessionName`, `cwd`, `realCwd`, `pid`, `ppid`, `ancestors` (nearest first, best effort: `ps` per hop, or on Windows one process-table read per walk; empty when it cannot be read), `mode`, `agentDir` (absolute agent dir the snapshot lives under), `herdr` (`paneId` from `HERDR_PANE_ID`, `env`) or `null` |
 | `project` | `cwd`, `branch`, `dirty` (changed files, `null` before the first scan) |
 | `model` | `id`, `provider`, `effort` (thinking level when the model reasons), `profile` `{ name, tier }` |
-| `persona` | always `null` (no reachable owner yet) |
+| `persona` | the active persona mode (`"gentleman"` or `"neutral"`, read like `/gentle:persona` does), or `null` when it could not be resolved |
 | `context` | `percent`, `tokens`, `window` |
 | `cost` | `total` (session spend), `subscription` |
 | `usage` | what the TUI usage panel (alt+u, `/gentle:usage`) shows, from the same owner: the session's provider at the top level (`provider`, `status`, `plan`, `fetchedAt`, `note`, `limits[]` with `name`, `limitReached` and every `windows[]` entry: `label`, `usedPercent`, `windowSeconds`, `resetAt`), and every provider the panel lists in `providers[]` (the session's own first, then its subagent routes; same fields). `note` is the panel's own words for a provider without windows (`usage arrives with the first response`, `no usage yet · r to fetch`, `fetch failed · r to retry`, `no subscription usage for this provider`), else `null`. `plan` is the plan name the provider reports (Codex does; Anthropic's headers carry none, so it stays `null` there, as in the panel). `null` before the owner answered |
@@ -82,7 +86,7 @@ gone or that were not updated for a day. The folder is created `0700` and files
 | `stats` | `turns`, `toolCalls`, `toolErrors`, `cost`, token counts, `cacheHitRate`, `durationMs`, `models[]` |
 | `activity` | `state` (`working`, `waiting`, `blocked`, `idle`), `streaming`, ODD `phase` and `phaseLabel`, `blockedLabel`; S15: `agents` and `jobs` (the session's subagents and background jobs that still run, the same numbers as `agents.active` and `jobs.running`) and `label`, the words every desktop region shows: "Working · 2 agents" while the turn runs, "Waiting on 2 agents · 1 job" once the turn ended but that work still runs (`waiting`, never `idle`), the blocker's label, else "Idle". Background subagents are the agents owner's, not the jobs registry's: they count in `agents`, never in `jobs` |
 | `pendingQuestion` | the open question or `null` (below) |
-| `commands` | the session's slash commands for the desktop palette and the composer's `/` menu: `items[]` (`name`, `description`, `args`, `terminal`, `source`) and `truncated` (below) |
+| `commands` | the session's slash commands for the desktop palette and the composer's `/` menu: `items[]` (`name`, `description`, `args`, `terminal`, `rpc`, `source`) and `truncated` (below) |
 
 `pendingQuestion.kind` is `choice` (`ask_user_choice`), `questionnaire`
 (`ask_user_question`), `prompt` (an extension dialog: `promptKind` is `select`,
@@ -111,7 +115,12 @@ away), then pi's command registry in its own order: extension commands
 (`extension`), prompt templates (`prompt`) and skills (`skill`). `terminal` is `true`
 when the command answers with a screen of the TUI (a picker, a panel, a status
 report), so the desktop shows the Terminal after sending it; prompt templates and
-skills answer in the conversation. `args` names the argument a command needs
+skills answer in the conversation. `rpc` is `true` when the command works from an RPC
+client (Gentle Shell's own declaration in `lib/desktop-command-rpc.ts` for extension
+commands, a matching Pi RPC command for built-ins, always for prompt templates and
+skills) and `false` otherwise, including every undeclared extension command; it never
+changes `terminal`, which keeps its meaning for Herdr, and `send_prompt` still refuses
+extension commands (`terminal_command`). `args` names the argument a command needs
 (`/name <name>`): the desktop puts it in the composer instead of sending it. The
 desktop RPC's own `gentle:desktop` channel is never listed; source paths never
 reach the file.
